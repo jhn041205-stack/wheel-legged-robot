@@ -50,13 +50,9 @@ typedef enum __MotorType {
     MG_5010,
     CYBERGEAR_MOTOR,
 } MotorType_e;
-// USB RC control link
-#define CL_RC_USB 0x104
-
-// USB RC source selection
+#define CL_RC_USB            0x104
 #define USB_RC_SOURCE_VIRTUAL_RC 0x01
 #define USB_RC_SOURCE_ROBOT_CMD  0x02
-
 // clang-format on
 
 #endif /* ROBOT_TYPEDEF_H */

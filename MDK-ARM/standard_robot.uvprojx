@@ -3309,6 +3309,11 @@
               <FilePath>..\application\chassis\chassis_task.c</FilePath>
             </File>
             <File>
+              <FileName>clamp_control.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\application\chassis\clamp_control.c</FilePath>
+            </File>
+            <File>
               <FileName>chassis_balance.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\application\chassis\chassis_balance.c</FilePath>

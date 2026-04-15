@@ -54,7 +54,6 @@
 #include "cmsis_os.h"
 #include "robot_param.h"
 #include "communication.h"
-#include "usb_task.h"
 
 /**
   * @brief          init error_list, assign  offline_time, online_time, priority.
@@ -193,11 +192,6 @@ bool_t toe_is_error(uint8_t toe)
     if(toe == DBUS_TOE)
     {
         return GetUartRcOffline();
-    }
-#elif __CONTROL_LINK_RC == CL_RC_USB
-    if(toe == DBUS_TOE)
-    {
-        return GetUsbRcOffline();
     }
 #endif
 

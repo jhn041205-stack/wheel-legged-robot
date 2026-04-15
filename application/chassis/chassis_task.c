@@ -23,14 +23,19 @@
 #include "chassis_balance.h"
 #include "cmsis_os.h"
 #include "usb_debug.h"
+#include "clamp_control.h"
 
-#ifndef CHASSIS_TASK_INIT_TIME
-#define CHASSIS_TASK_INIT_TIME 357
-#endif  // CHASSIS_TASK_INIT_TIME
+#ifndef CHASSIS_TASK_INIT_TIME_MS
+#define CHASSIS_TASK_INIT_TIME_MS 1500
+#endif  // CHASSIS_TASK_INIT_TIME_MS
 
 #ifndef CHASSIS_CONTROL_TIME_MS
 #define CHASSIS_CONTROL_TIME_MS 2
 #endif  // CHASSIS_CONTROL_TIME_MS
+
+#ifndef CLAMP_TEST_STEP_TIME_MS
+#define CLAMP_TEST_STEP_TIME_MS 1000
+#endif  // CLAMP_TEST_STEP_TIME_MS
 
 #if INCLUDE_uxTaskGetStackHighWaterMark
 uint32_t chassis_high_water;
@@ -54,12 +59,17 @@ void chassis_task(void const * pvParameters)
 {
     ChassisPublish();
     // 空闲一段时间
-    vTaskDelay(CHASSIS_TASK_INIT_TIME);
+    vTaskDelay(pdMS_TO_TICKS(CHASSIS_TASK_INIT_TIME_MS));
+    // 初始化夹爪
+    ClampInit();
     // 初始化底盘
     ChassisInit();
-    TickType_t last = xTaskGetTickCount();
-    const TickType_t period = pdMS_TO_TICKS(2);
 
+    // static uint8_t clamp_test_step = 0;
+    // static uint32_t clamp_test_next_tick = 0;
+
+    TickType_t last = xTaskGetTickCount();
+    const TickType_t period = pdMS_TO_TICKS(CHASSIS_CONTROL_TIME_MS);
     while (1) {
         // 更新状态量
         ChassisObserver();
@@ -69,10 +79,13 @@ void chassis_task(void const * pvParameters)
         ChassisSetMode();
         // 更新目标量
         ChassisReference();
+        //通过串口输出夹爪位置控制值
         // 计算控制量
         ChassisConsole();
         // 发送控制量
         ChassisSendCmd();
+        // 夹爪输入处理
+        Clampcontrol();
         // 系统延时
         // vTaskDelay(CHASSIS_CONTROL_TIME_MS);
         vTaskDelayUntil(&last, period);

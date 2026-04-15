@@ -128,35 +128,6 @@ void Usart1Init(void)
     Uart2SendDataInit();
 }
 
-// 4pin Uart口中断处理函数
-void USART1_IRQHandler(void)
-{
-    static volatile uint8_t res;
-    if (USART1->SR & UART_FLAG_IDLE) {
-        __HAL_UART_CLEAR_PEFLAG(&huart1);
-
-        static uint16_t this_time_rx_len = 0;
-
-        if ((huart1.hdmarx->Instance->CR & DMA_SxCR_CT) == RESET) {
-            __HAL_DMA_DISABLE(huart1.hdmarx);
-            this_time_rx_len = USART_RX_BUF_LENGHT - __HAL_DMA_GET_COUNTER(huart1.hdmarx);
-            __HAL_DMA_SET_COUNTER(huart1.hdmarx, USART_RX_BUF_LENGHT);
-            huart1.hdmarx->Instance->CR |= DMA_SxCR_CT;
-            __HAL_DMA_ENABLE(huart1.hdmarx);
-            fifo_s_puts(&usart1_fifo, (char *)usart1_buf[0], this_time_rx_len);
-            LastReceiveTime.Interrupt = HAL_GetTick();
-        } else {
-            __HAL_DMA_DISABLE(huart1.hdmarx);
-            this_time_rx_len = USART_RX_BUF_LENGHT - __HAL_DMA_GET_COUNTER(huart1.hdmarx);
-            __HAL_DMA_SET_COUNTER(huart1.hdmarx, USART_RX_BUF_LENGHT);
-            huart1.hdmarx->Instance->CR &= ~(DMA_SxCR_CT);
-            __HAL_DMA_ENABLE(huart1.hdmarx);
-            fifo_s_puts(&usart1_fifo, (char *)usart1_buf[1], this_time_rx_len);
-            LastReceiveTime.Interrupt = HAL_GetTick();
-        }
-    }
-}
-
 /*******************************************************************************/
 /* Uart2 Send Data Renew                                                       */
 /*     DataTestRenew                                                           */

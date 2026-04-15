@@ -1,8 +1,10 @@
 /**
   ****************************(C) COPYRIGHT 2025 Polarbear****************************
   * @file       remote_control.c/h
-  * @brief      閬ユ帶鍣ㄥ鐞嗭紝閬ユ帶鍣ㄦ槸閫氳繃绫讳技SBUS鐨勫崗璁紶杈擄紝鍒╃敤DMA浼犺緭鏂瑰紡鑺傜害CPU
-  *             璧勬簮锛屽埄鐢ㄤ覆鍙ｇ┖闂蹭腑鏂潵鎷夎捣澶勭悊鍑芥暟锛屽悓鏃舵彁渚涗竴浜涙帀绾块噸鍚疍MA锛屼覆鍙?  *             鐨勬柟寮忎繚璇佺儹鎻掓嫈鐨勭ǔ瀹氭€с€?  * @note       璇ヤ换鍔℃槸閫氳繃涓插彛涓柇鍚姩锛屼笉鏄痜reeRTOS浠诲姟
+  * @brief      遥控器处理，遥控器是通过类似SBUS的协议传输，利用DMA传输方式节约CPU
+  *             资源，利用串口空闲中断来拉起处理函数，同时提供一些掉线重启DMA，串口
+  *             的方式保证热插拔的稳定性。
+  * @note       该任务是通过串口中断启动，不是freeRTOS任务
   * @history
   *  Version    Date            Author          Modification
   *  V1.0.0     Dec-26-2018     RM              1. done
@@ -14,16 +16,16 @@
   *
   @verbatim
   ==============================================================================
-  浣跨敤At9sPro閬ユ帶鍣ㄦ椂璇疯缃?閫氫负SwE锛?閫氫负SwG
+  使用At9sPro遥控器时请设置5通为SwE，6通为SwG
 
-  娉細浣跨敤闈濪T7閬ユ帶鍣ㄦ椂锛岄渶瑕佸厛妫€鏌ラ€氶亾鍊兼暟鎹槸鍚︽甯革紙涓€鑸仴鎺у櫒閮藉甫鏈夐€氶亾鍊兼暟鎹亸绉诲姛鑳斤紝灏嗛€氶亾鍊间腑鍊肩Щ鍔ㄥ埌姝ｇ‘鏁板€煎悗鍐嶄娇鐢級
-      AT9S PRO 閬ユ帶鍣ㄤ腑鍊间负 1000
-      HT8A 閬ユ帶鍣ㄤ腑鍊间负 992
-      ET08A 閬ユ帶鍣ㄤ腑鍊间负 1024
-  
-  ET08A 閬ユ帶鍣ㄨ缃寚鍗楋細
-    1. 璁剧疆 涓昏彍鍗?>绯荤粺璁剧疆->鎽囨潌妯″紡 涓烘ā寮?
-    2. 璁剧疆 涓昏彍鍗?>閫氱敤鍔熻兘->閫氶亾璁剧疆 5閫氶亾涓?[杈呭姪1 SB --] 6閫氶亾涓?[杈呭姪2 SC --]
+  注：使用非DT7遥控器时，需要先检查通道值数据是否正常（一般遥控器都带有通道值数据偏移功能，将通道值中值移动到正确数值后再使用）
+      AT9S PRO 遥控器中值为 1000
+      HT8A 遥控器中值为 992
+      ET08A 遥控器中值为 1024
+
+  ET08A 遥控器设置指南：
+    1. 设置 主菜单->系统设置->摇杆模式 为模式2
+    2. 设置 主菜单->通用功能->通道设置 5通道为 [辅助1 SB --] 6通道为 [辅助2 SC --]
   ==============================================================================
   @endverbatim
   ****************************(C) COPYRIGHT 2025 Polarbear****************************
@@ -42,18 +44,34 @@
 #include "communication.h"
 #include "usb_task.h"
 
-// Remote-control offline timeout.
+// 遥控器掉线时间阈值
 #define RC_LOST_TIME 100  // ms
-// Consecutive lost SBUS frames before judging disconnect for non-DT7 remotes.
+// 非dt7遥控器连续断线上线次数（超过认为断连）
 #define SBUS_MAX_LOST_NUN 10
-// Remote-control channel error threshold.
+
+//遥控器出错数据上限
 #define RC_CHANNAL_ERROR_VALUE 700
 
 extern UART_HandleTypeDef huart3;
 extern DMA_HandleTypeDef hdma_usart3_rx;
 
+
+//取正函数
 static int16_t RC_abs(int16_t value);
+static void SetUsbZeroRcCtrl(RC_ctrl_t * rc);
 static void RefreshActiveRcCtrl(void);
+/**
+  * @brief          remote control protocol resolution
+  * @param[in]      sbus_buf: raw data point
+  * @param[out]     rc_ctrl: remote control data struct point
+  * @retval         none
+  */
+/**
+  * @brief          遥控器协议解析
+  * @param[in]      sbus_buf: 原生数据指针
+  * @param[out]     rc_ctrl: 遥控器数据指
+  * @retval         none
+  */
 static void sbus_to_rc(volatile const uint8_t *sbus_buf, RC_ctrl_t *rc_ctrl);
 
 #if (__RC_TYPE == RC_AT9S_PRO)
@@ -64,24 +82,31 @@ static void Ht8aSbusToRc(volatile const uint8_t *sbus_buf, RC_ctrl_t *rc_ctrl);
 static void Et08aSbusToRc(volatile const uint8_t *sbus_buf, RC_ctrl_t *rc_ctrl);
 #endif
 
-// Active control source seen by the chassis.
-// Raw physical remote data is stored separately for USB authorization arbitration.
+//remote control data
+//遥控器控制变量
+RC_ctrl_t rc_ctrl;
 RC_ctrl_t rc_ctrl;
 static RC_ctrl_t raw_rc_ctrl;
 Sbus_t sbus = {.connect_flag = 0xFF};
 
-//鎺ユ敹鍘熷鏁版嵁锛屼负18涓瓧鑺傦紝缁欎簡36涓瓧鑺傞暱搴︼紝闃叉DMA浼犺緭瓒婄晫
+//接收原始数据，为18个字节，给了36个字节长度，防止DMA传输越界
 static uint8_t sbus_rx_buf[2][SBUS_RX_BUF_NUM];
 
-// 涓婁竴娆℃帴鏀舵暟鎹殑鏃堕棿
+// 上一次接收数据的时间
 static uint32_t last_receive_time = 0;
-// Count of consecutive valid receive events.
+#if 0
+/*
+// 记录连续接收数据的次数
+*/
+// 记录非dt7的sbus遥控器连续断连次数
+static uint32_t sbus_lost_count = SBUS_MAX_LOST_NUN + 5;
+
+#endif
 static uint32_t receive_count = 0;
-// Lost-count tracking for non-DT7 SBUS remotes.
 static uint32_t sbus_lost_count = SBUS_MAX_LOST_NUN + 5;
 
 #if (__RC_TYPE != RC_DT7)
-static uint8_t connected_flag;  // 閬ユ帶鍣ㄨ繛鎺ユ爣蹇椾綅
+static uint8_t connected_flag;  // 遥控器连接标志位
 #endif  // __RC_TYPE != RC_DT7
 
 /**
@@ -90,7 +115,7 @@ static uint8_t connected_flag;  // 閬ユ帶鍣ㄨ繛鎺ユ爣蹇椾綅
   * @retval         none
   */
 /**
-  * @brief          閬ユ帶鍣ㄥ垵濮嬪寲
+  * @brief          遥控器初始化
   * @param[in]      none
   * @retval         none
   */
@@ -113,8 +138,10 @@ void remote_control_init(void)
   * @retval         remote control data point
   */
 /**
-  * @brief          鑾峰彇閬ユ帶鍣ㄦ暟鎹寚閽?  * @param[in]      none
-  * @retval         閬ユ帶鍣ㄦ暟鎹寚閽?  */
+  * @brief          获取遥控器数据指针
+  * @param[in]      none
+  * @retval         遥控器数据指针
+  */
 const RC_ctrl_t *get_remote_control_point(void)
 {
     return &rc_ctrl;
@@ -123,29 +150,91 @@ const RC_ctrl_t *get_remote_control_point(void)
 void RefreshRcControlSource(void) { RefreshActiveRcCtrl(); }
 
 /**
-  * @brief          鑾峰彇SBUS閬ユ帶鍣ㄦ暟鎹寚閽?  * @param[in]      none
-  * @retval         SBUS閬ユ帶鍣ㄦ暟鎹寚閽?  */
+  * @brief          获取SBUS遥控器数据指针
+  * @param[in]      none
+  * @retval         SBUS遥控器数据指针
+  */
 const Sbus_t *get_sbus_point(void)
 {
     return &sbus;
 }
 
+static void SetUsbZeroRcCtrl(RC_ctrl_t * rc)
+{
+    memset(rc, 0, sizeof(RC_ctrl_t));
+    rc->rc.s[CHASSIS_MODE_CHANNEL] = RC_SW_MID;
+    rc->rc.s[CHASSIS_FUNCTION] = RC_SW_DOWN;
+}
+
+//判断遥控器数据是否出错，
 static void RefreshActiveRcCtrl(void)
 {
-    bool usb_authorized =
-        (raw_rc_ctrl.rc.s[CHASSIS_MODE_CHANNEL] == RC_SW_DOWN) && !GetUsbOffline();
+    bool usb_control_selected =
+        (raw_rc_ctrl.rc.s[CHASSIS_MODE_CHANNEL] == RC_SW_DOWN) &&
+        (raw_rc_ctrl.rc.s[CHASSIS_FUNCTION] == RC_SW_MID);
 
-    if (usb_authorized) {
-        memcpy(&rc_ctrl, GetUsbVirtualRcCtrl(), sizeof(RC_ctrl_t));
+    if (usb_control_selected) {
+        if (GetUsbOffline()) {
+            SetUsbZeroRcCtrl(&rc_ctrl);
+        } else {
+            memcpy(&rc_ctrl, GetUsbVirtualRcCtrl(), sizeof(RC_ctrl_t));
+        }
     } else {
         memcpy(&rc_ctrl, &raw_rc_ctrl, sizeof(RC_ctrl_t));
     }
 }
 
-//鍒ゆ柇閬ユ帶鍣ㄦ暟鎹槸鍚﹀嚭閿欙紝
+#if 0
 uint8_t RC_data_is_error(void)
 {
-    // Validate the physical remote data before it participates in source arbitration.
+    //使用了go to语句 方便出错统一处理遥控器变量数据归零
+    if (RC_abs(rc_ctrl.rc.ch[0]) > RC_CHANNAL_ERROR_VALUE)
+    {
+        goto error;
+    }
+    if (RC_abs(rc_ctrl.rc.ch[1]) > RC_CHANNAL_ERROR_VALUE)
+    {
+        goto error;
+    }
+    if (RC_abs(rc_ctrl.rc.ch[2]) > RC_CHANNAL_ERROR_VALUE)
+    {
+        goto error;
+    }
+    if (RC_abs(rc_ctrl.rc.ch[3]) > RC_CHANNAL_ERROR_VALUE)
+    {
+        goto error;
+    }
+    if (rc_ctrl.rc.s[0] == 0)
+    {
+        goto error;
+    }
+    if (rc_ctrl.rc.s[1] == 0)
+    {
+        goto error;
+    }
+    return 0;
+
+error:
+    rc_ctrl.rc.ch[0] = 0;
+    rc_ctrl.rc.ch[1] = 0;
+    rc_ctrl.rc.ch[2] = 0;
+    rc_ctrl.rc.ch[3] = 0;
+    rc_ctrl.rc.ch[4] = 0;
+    rc_ctrl.rc.s[0] = RC_SW_DOWN;
+    rc_ctrl.rc.s[1] = RC_SW_DOWN;
+    rc_ctrl.mouse.x = 0;
+    rc_ctrl.mouse.y = 0;
+    rc_ctrl.mouse.z = 0;
+    rc_ctrl.mouse.press_l = 0;
+    rc_ctrl.mouse.press_r = 0;
+    rc_ctrl.key.v = 0;
+    return 1;
+}
+
+#endif
+
+uint8_t RC_data_is_error(void)
+{
     if (RC_abs(raw_rc_ctrl.rc.ch[0]) > RC_CHANNAL_ERROR_VALUE)
     {
         goto error;
@@ -200,7 +289,7 @@ void slove_data_error(void)
 }
 
 // clang-format on
-// Record consecutive valid receive events.
+// 记录接收数据的次数
 #define COUNT_RECEIVED                            \
     if (now - last_receive_time > RC_LOST_TIME) { \
         receive_count = 0;                        \
@@ -208,10 +297,11 @@ void slove_data_error(void)
     receive_count++;
 // clang-format off
 
-//涓插彛涓柇
+//串口中断
+#if 0
 void USART3_IRQHandler(void)
 {
-    if (huart3.Instance->SR & UART_FLAG_RXNE)
+    if(huart3.Instance->SR & UART_FLAG_RXNE)//接收到数据
     {
         __HAL_UART_CLEAR_PEFLAG(&huart3);
     }
@@ -228,53 +318,59 @@ void USART3_IRQHandler(void)
             /* Current memory buffer used is Memory 0 */
 
             //disable DMA
-            //澶辨晥DMA
+            //失效DMA
             __HAL_DMA_DISABLE(&hdma_usart3_rx);
 
             //get receive data length, length = set_data_length - remain_length
-            //鑾峰彇鎺ユ敹鏁版嵁闀垮害,闀垮害 = 璁惧畾闀垮害 - 鍓╀綑闀垮害
+            //获取接收数据长度,长度 = 设定长度 - 剩余长度
             this_time_rx_len = SBUS_RX_BUF_NUM - hdma_usart3_rx.Instance->NDTR;
 
             //reset set_data_lenght
-            //閲嶆柊璁惧畾鏁版嵁闀垮害
+            //重新设定数据长度
             hdma_usart3_rx.Instance->NDTR = SBUS_RX_BUF_NUM;
 
             //set memory buffer 1
-            //璁惧畾缂撳啿鍖?
+            //设定缓冲区1
             hdma_usart3_rx.Instance->CR |= DMA_SxCR_CT;
             
             //enable DMA
-            //浣胯兘DMA
+            //使能DMA
             __HAL_DMA_ENABLE(&hdma_usart3_rx);
 
             if(this_time_rx_len == RC_FRAME_LENGTH)
             {
-                //澶勭悊閬ユ帶鍣ㄦ暟鎹?
-                sbus_to_rc(sbus_rx_buf[0], &raw_rc_ctrl);
-                RefreshActiveRcCtrl();
-                
+                //处理遥控器数据
+                sbus_to_rc(sbus_rx_buf[0], &rc_ctrl);
+
                 COUNT_RECEIVED
-                
-                //璁板綍鏁版嵁鎺ユ敹鏃堕棿
+                memcpy(&raw_rc_ctrl, &rc_ctrl, sizeof(RC_ctrl_t));
+                RefreshActiveRcCtrl();
+                memcpy(&raw_rc_ctrl, &rc_ctrl, sizeof(RC_ctrl_t));
+                RefreshActiveRcCtrl();
+                memcpy(&raw_rc_ctrl, &rc_ctrl, sizeof(RC_ctrl_t));
+                RefreshActiveRcCtrl();
+                memcpy(&raw_rc_ctrl, &rc_ctrl, sizeof(RC_ctrl_t));
+                RefreshActiveRcCtrl();
+
+                //记录数据接收时间
                 last_receive_time = HAL_GetTick();
                 detect_hook(DBUS_TOE);
                 sbus_to_usart1(sbus_rx_buf[0]);
             } 
             else if (this_time_rx_len == SBUS_RC_FRAME_LENGTH)
             {
-                //澶勭悊閬ユ帶鍣ㄦ暟鎹?
+                //处理遥控器数据
 #if (__RC_TYPE == RC_AT9S_PRO)
-                At9sProSbusToRc(sbus_rx_buf[0], &raw_rc_ctrl);
+                At9sProSbusToRc(sbus_rx_buf[0], &rc_ctrl);
 #elif (__RC_TYPE == RC_HT8A)
-                Ht8aSbusToRc(sbus_rx_buf[0], &raw_rc_ctrl);
+                Ht8aSbusToRc(sbus_rx_buf[0], &rc_ctrl);
 #elif (__RC_TYPE == RC_ET08A)
-                Et08aSbusToRc(sbus_rx_buf[0], &raw_rc_ctrl);
+                Et08aSbusToRc(sbus_rx_buf[0], &rc_ctrl);
 #endif
-                RefreshActiveRcCtrl();
                 
                 COUNT_RECEIVED
                 
-                //璁板綍鏁版嵁鎺ユ敹鏃堕棿
+                //记录数据接收时间
                 last_receive_time = HAL_GetTick();
                 detect_hook(DBUS_TOE);
             }
@@ -283,53 +379,51 @@ void USART3_IRQHandler(void)
         {
             /* Current memory buffer used is Memory 1 */
             //disable DMA
-            //澶辨晥DMA
+            //失效DMA
             __HAL_DMA_DISABLE(&hdma_usart3_rx);
 
             //get receive data length, length = set_data_length - remain_length
-            //鑾峰彇鎺ユ敹鏁版嵁闀垮害,闀垮害 = 璁惧畾闀垮害 - 鍓╀綑闀垮害
+            //获取接收数据长度,长度 = 设定长度 - 剩余长度
             this_time_rx_len = SBUS_RX_BUF_NUM - hdma_usart3_rx.Instance->NDTR;
 
             //reset set_data_lenght
-            //閲嶆柊璁惧畾鏁版嵁闀垮害
+            //重新设定数据长度
             hdma_usart3_rx.Instance->NDTR = SBUS_RX_BUF_NUM;
 
             //set memory buffer 0
-            //璁惧畾缂撳啿鍖?
+            //设定缓冲区0
             DMA1_Stream1->CR &= ~(DMA_SxCR_CT);
             
             //enable DMA
-            //浣胯兘DMA
+            //使能DMA
             __HAL_DMA_ENABLE(&hdma_usart3_rx);
 
             if(this_time_rx_len == RC_FRAME_LENGTH)
             {
-                //澶勭悊閬ユ帶鍣ㄦ暟鎹?
-                sbus_to_rc(sbus_rx_buf[1], &raw_rc_ctrl);
-                RefreshActiveRcCtrl();
-                
+                //处理遥控器数据
+                sbus_to_rc(sbus_rx_buf[1], &rc_ctrl);
+
                 COUNT_RECEIVED
 
-                //璁板綍鏁版嵁鎺ユ敹鏃堕棿
+                //记录数据接收时间
                 last_receive_time = HAL_GetTick();
                 detect_hook(DBUS_TOE);
                 sbus_to_usart1(sbus_rx_buf[1]);
             }
             else if (this_time_rx_len == SBUS_RC_FRAME_LENGTH)
             {
-                //澶勭悊閬ユ帶鍣ㄦ暟鎹?
+                //处理遥控器数据
 #if (__RC_TYPE == RC_AT9S_PRO)
-                At9sProSbusToRc(sbus_rx_buf[1], &raw_rc_ctrl);
+                At9sProSbusToRc(sbus_rx_buf[1], &rc_ctrl);
 #elif (__RC_TYPE == RC_HT8A)
-                Ht8aSbusToRc(sbus_rx_buf[1], &raw_rc_ctrl);
+                Ht8aSbusToRc(sbus_rx_buf[1], &rc_ctrl);
 #elif (__RC_TYPE == RC_ET08A)
-                Et08aSbusToRc(sbus_rx_buf[1], &raw_rc_ctrl);
+                Et08aSbusToRc(sbus_rx_buf[1], &rc_ctrl);
 #endif
-                RefreshActiveRcCtrl();
-                
+
                 COUNT_RECEIVED
 
-                //璁板綍鏁版嵁鎺ユ敹鏃堕棿
+                //记录数据接收时间
                 last_receive_time = HAL_GetTick();
                 detect_hook(DBUS_TOE);
             }
@@ -338,7 +432,100 @@ void USART3_IRQHandler(void)
 
 }
 
-//鍙栨鍑芥暟
+//取正函数
+#endif
+
+void USART3_IRQHandler(void)
+{
+    if (huart3.Instance->SR & UART_FLAG_RXNE)
+    {
+        __HAL_UART_CLEAR_PEFLAG(&huart3);
+    }
+    else if (USART3->SR & UART_FLAG_IDLE)
+    {
+        static uint16_t this_time_rx_len = 0;
+
+        __HAL_UART_CLEAR_PEFLAG(&huart3);
+
+        uint32_t now = HAL_GetTick();
+
+        if ((hdma_usart3_rx.Instance->CR & DMA_SxCR_CT) == RESET)
+        {
+            __HAL_DMA_DISABLE(&hdma_usart3_rx);
+
+            this_time_rx_len = SBUS_RX_BUF_NUM - hdma_usart3_rx.Instance->NDTR;
+            hdma_usart3_rx.Instance->NDTR = SBUS_RX_BUF_NUM;
+            hdma_usart3_rx.Instance->CR |= DMA_SxCR_CT;
+            __HAL_DMA_ENABLE(&hdma_usart3_rx);
+
+            if (this_time_rx_len == RC_FRAME_LENGTH)
+            {
+                sbus_to_rc(sbus_rx_buf[0], &raw_rc_ctrl);
+                RefreshActiveRcCtrl();
+
+                COUNT_RECEIVED
+
+                last_receive_time = HAL_GetTick();
+                detect_hook(DBUS_TOE);
+                sbus_to_usart1(sbus_rx_buf[0]);
+            }
+            else if (this_time_rx_len == SBUS_RC_FRAME_LENGTH)
+            {
+#if (__RC_TYPE == RC_AT9S_PRO)
+                At9sProSbusToRc(sbus_rx_buf[0], &raw_rc_ctrl);
+#elif (__RC_TYPE == RC_HT8A)
+                Ht8aSbusToRc(sbus_rx_buf[0], &raw_rc_ctrl);
+#elif (__RC_TYPE == RC_ET08A)
+                Et08aSbusToRc(sbus_rx_buf[0], &raw_rc_ctrl);
+#endif
+                RefreshActiveRcCtrl();
+
+                COUNT_RECEIVED
+
+                last_receive_time = HAL_GetTick();
+                detect_hook(DBUS_TOE);
+            }
+        }
+        else
+        {
+            __HAL_DMA_DISABLE(&hdma_usart3_rx);
+
+            this_time_rx_len = SBUS_RX_BUF_NUM - hdma_usart3_rx.Instance->NDTR;
+            hdma_usart3_rx.Instance->NDTR = SBUS_RX_BUF_NUM;
+            DMA1_Stream1->CR &= ~(DMA_SxCR_CT);
+            __HAL_DMA_ENABLE(&hdma_usart3_rx);
+
+            if (this_time_rx_len == RC_FRAME_LENGTH)
+            {
+                sbus_to_rc(sbus_rx_buf[1], &raw_rc_ctrl);
+                RefreshActiveRcCtrl();
+
+                COUNT_RECEIVED
+
+                last_receive_time = HAL_GetTick();
+                detect_hook(DBUS_TOE);
+                sbus_to_usart1(sbus_rx_buf[1]);
+            }
+            else if (this_time_rx_len == SBUS_RC_FRAME_LENGTH)
+            {
+#if (__RC_TYPE == RC_AT9S_PRO)
+                At9sProSbusToRc(sbus_rx_buf[1], &raw_rc_ctrl);
+#elif (__RC_TYPE == RC_HT8A)
+                Ht8aSbusToRc(sbus_rx_buf[1], &raw_rc_ctrl);
+#elif (__RC_TYPE == RC_ET08A)
+                Et08aSbusToRc(sbus_rx_buf[1], &raw_rc_ctrl);
+#endif
+                RefreshActiveRcCtrl();
+
+                COUNT_RECEIVED
+
+                last_receive_time = HAL_GetTick();
+                detect_hook(DBUS_TOE);
+            }
+        }
+    }
+}
+
 static int16_t RC_abs(int16_t value)
 {
     if (value > 0)
@@ -357,8 +544,9 @@ static int16_t RC_abs(int16_t value)
   * @retval         none
   */
 /**
-  * @brief          閬ユ帶鍣ㄥ崗璁В鏋?  * @param[in]      sbus_buf: 鍘熺敓鏁版嵁鎸囬拡
-  * @param[out]     rc_ctrl: 閬ユ帶鍣ㄦ暟鎹寚
+  * @brief          遥控器协议解析
+  * @param[in]      sbus_buf: 原生数据指针
+  * @param[out]     rc_ctrl: 遥控器数据指
   * @retval         none
   */
 static void sbus_to_rc(volatile const uint8_t *sbus_buf, RC_ctrl_t *rc_ctrl)
@@ -390,7 +578,7 @@ static void sbus_to_rc(volatile const uint8_t *sbus_buf, RC_ctrl_t *rc_ctrl)
     rc_ctrl->rc.ch[4] -= RC_CH_VALUE_OFFSET;
 }
 
-
+// SBUS通道解析
 #define SBUS_DECODE()                                                                 \
     sbus.ch[0] =((sbus_buf[2]<<8)   + (sbus_buf[1])) & 0x07ff;                        \
     sbus.ch[1] =((sbus_buf[3]<<5)   + (sbus_buf[2]>>3)) & 0x07ff;                     \
@@ -417,7 +605,7 @@ static void sbus_to_rc(volatile const uint8_t *sbus_buf, RC_ctrl_t *rc_ctrl)
         sbus_lost_count++;                     \
     }
 
-// DT7閬ユ帶鍣ㄧ壒娈婇€氶亾缃浂
+// DT7遥控器特殊通道置零
 #define SPECIAL_CHANNEL_SET_SERO()\
     rc_ctrl->mouse.x = 0;         \
     rc_ctrl->mouse.y = 0;         \
@@ -430,8 +618,10 @@ static void sbus_to_rc(volatile const uint8_t *sbus_buf, RC_ctrl_t *rc_ctrl)
 #if (__RC_TYPE == RC_AT9S_PRO)
 
 /**
-  * @brief          AT9S PRO 閬ユ帶鍣ㄥ崗璁В鏋?  * @param[in]      sbus_buf: 鍘熺敓鏁版嵁鎸囬拡
-  * @param[out]     rc_ctrl: 閬ユ帶鍣ㄦ暟鎹寚閽?  * @retval         none
+  * @brief          AT9S PRO 遥控器协议解析
+  * @param[in]      sbus_buf: 原生数据指针
+  * @param[out]     rc_ctrl: 遥控器数据指针
+  * @retval         none
   */
 static void At9sProSbusToRc(volatile const uint8_t *sbus_buf, RC_ctrl_t *rc_ctrl)
 {
@@ -440,11 +630,11 @@ static void At9sProSbusToRc(volatile const uint8_t *sbus_buf, RC_ctrl_t *rc_ctrl
         return;
     }
 
-    // SBUS閫氶亾瑙ｆ瀽
+    // SBUS通道解析
     SBUS_DECODE()
     SBUS_LOST_CHECK()
 
-    // 灏哠BUS閫氶亾鏁版嵁杞崲涓篋T7閬ユ帶鍣ㄦ暟鎹紝鏂逛究鍏煎浣跨敤
+    // 将SBUS通道数据转换为DT7遥控器数据，方便兼容使用
     rc_ctrl->rc.ch[0] =  (sbus.ch[0] - AT9S_PRO_RC_CH_VALUE_OFFSET) / 800.0f * 660;
     rc_ctrl->rc.ch[1] = -(sbus.ch[1] - AT9S_PRO_RC_CH_VALUE_OFFSET) / 800.0f * 660;
     rc_ctrl->rc.ch[2] =  (sbus.ch[3] - AT9S_PRO_RC_CH_VALUE_OFFSET) / 800.0f * 660;
@@ -454,15 +644,17 @@ static void At9sProSbusToRc(volatile const uint8_t *sbus_buf, RC_ctrl_t *rc_ctrl
     rc_ctrl->rc.s[0] = sw_mapping[(sbus.ch[5] - AT9S_PRO_RC_CH_VALUE_OFFSET) / 800 + 1];
     rc_ctrl->rc.s[1] = sw_mapping[(sbus.ch[4] - AT9S_PRO_RC_CH_VALUE_OFFSET) / 800 + 1];
 
-    // AT9S PRO 閬ユ帶鍣ㄦ病鏈夐紶鏍囧拰閿洏鏁版嵁
+    // AT9S PRO 遥控器没有鼠标和键盘数据
     SPECIAL_CHANNEL_SET_SERO()
 }
 
 #elif (__RC_TYPE == RC_HT8A)
 
 /**
-  * @brief          HT8A 閬ユ帶鍣ㄥ崗璁В鏋?  * @param[in]      sbus_buf: 鍘熺敓鏁版嵁鎸囬拡
-  * @param[out]     rc_ctrl: 閬ユ帶鍣ㄦ暟鎹寚閽?  * @retval         none
+  * @brief          HT8A 遥控器协议解析
+  * @param[in]      sbus_buf: 原生数据指针
+  * @param[out]     rc_ctrl: 遥控器数据指针
+  * @retval         none
   */
 static void Ht8aSbusToRc(volatile const uint8_t *sbus_buf, RC_ctrl_t *rc_ctrl)
 {
@@ -471,11 +663,11 @@ static void Ht8aSbusToRc(volatile const uint8_t *sbus_buf, RC_ctrl_t *rc_ctrl)
         return;
     }
 
-    // SBUS閫氶亾瑙ｆ瀽
+    // SBUS通道解析
     SBUS_DECODE()
     SBUS_LOST_CHECK()
 
-    // 灏哠BUS閫氶亾鏁版嵁杞崲涓篋T7閬ユ帶鍣ㄦ暟鎹紝鏂逛究鍏煎浣跨敤
+    // 将SBUS通道数据转换为DT7遥控器数据，方便兼容使用
     rc_ctrl->rc.ch[0] =  (sbus.ch[0] - HT8A_RC_CH013_VALUE_OFFSET) / 560.0f * 660;
     rc_ctrl->rc.ch[1] =  (sbus.ch[1] - HT8A_RC_CH013_VALUE_OFFSET) / 560.0f * 660;
     rc_ctrl->rc.ch[2] =  (sbus.ch[3] - HT8A_RC_CH013_VALUE_OFFSET) / 560.0f * 660;
@@ -485,15 +677,17 @@ static void Ht8aSbusToRc(volatile const uint8_t *sbus_buf, RC_ctrl_t *rc_ctrl)
     rc_ctrl->rc.s[0] = sw_mapping[(sbus.ch[7] - HT8A_RC_CH247_VALUE_OFFSET) / 800 + 1];
     rc_ctrl->rc.s[1] = sw_mapping[(sbus.ch[4] - HT8A_RC_CH247_VALUE_OFFSET) / 800 + 1];
 
-    // HT8A 閬ユ帶鍣ㄦ病鏈夐紶鏍囧拰閿洏鏁版嵁
+    // HT8A 遥控器没有鼠标和键盘数据
     SPECIAL_CHANNEL_SET_SERO()
 }
 
 #elif (__RC_TYPE == RC_ET08A)
 
 /**
-  * @brief          ET08A 閬ユ帶鍣ㄥ崗璁В鏋?  * @param[in]      sbus_buf: 鍘熺敓鏁版嵁鎸囬拡
-  * @param[out]     rc_ctrl: 閬ユ帶鍣ㄦ暟鎹寚閽?  * @retval         none
+  * @brief          ET08A 遥控器协议解析
+  * @param[in]      sbus_buf: 原生数据指针
+  * @param[out]     rc_ctrl: 遥控器数据指针
+  * @retval         none
   */
 static void Et08aSbusToRc(volatile const uint8_t *sbus_buf, RC_ctrl_t *rc_ctrl){
     if (sbus_buf == NULL || rc_ctrl == NULL)
@@ -501,11 +695,11 @@ static void Et08aSbusToRc(volatile const uint8_t *sbus_buf, RC_ctrl_t *rc_ctrl){
         return;
     }
 
-    // SBUS閫氶亾瑙ｆ瀽
+    // SBUS通道解析
     SBUS_DECODE()
     SBUS_LOST_CHECK()
 
-    // 灏哠BUS閫氶亾鏁版嵁杞崲涓篋T7閬ユ帶鍣ㄦ暟鎹紝鏂逛究鍏煎浣跨敤
+    // 将SBUS通道数据转换为DT7遥控器数据，方便兼容使用
     rc_ctrl->rc.ch[0] =  (sbus.ch[0] - ET08A_RC_CH_VALUE_OFFSET) / 671.0f * 660;
     rc_ctrl->rc.ch[1] = -(sbus.ch[1] - ET08A_RC_CH_VALUE_OFFSET) / 671.0f * 660;
     rc_ctrl->rc.ch[2] =  (sbus.ch[3] - ET08A_RC_CH_VALUE_OFFSET) / 671.0f * 660;
@@ -515,7 +709,7 @@ static void Et08aSbusToRc(volatile const uint8_t *sbus_buf, RC_ctrl_t *rc_ctrl){
     rc_ctrl->rc.s[0] = sw_mapping[(sbus.ch[5] - ET08A_RC_CH_VALUE_OFFSET) / 670 + 1];
     rc_ctrl->rc.s[1] = sw_mapping[(sbus.ch[4] - ET08A_RC_CH_VALUE_OFFSET) / 670 + 1];
 
-    // ET08A 閬ユ帶鍣ㄦ病鏈夐紶鏍囧拰閿洏鏁版嵁
+    // ET08A 遥控器没有鼠标和键盘数据
     SPECIAL_CHANNEL_SET_SERO()
 }
 
@@ -530,8 +724,8 @@ static void Et08aSbusToRc(volatile const uint8_t *sbus_buf, RC_ctrl_t *rc_ctrl){
   * @retval         none
   */
 /**
-  * @brief          閫氳繃usart1鍙戦€乻bus鏁版嵁,鍦╱sart3_IRQHandle璋冪敤
-  * @param[in]      sbus: sbus鏁版嵁, 18瀛楄妭
+  * @brief          通过usart1发送sbus数据,在usart3_IRQHandle调用
+  * @param[in]      sbus: sbus数据, 18字节
   * @retval         none
   */
 void sbus_to_usart1(uint8_t *sbus)
@@ -561,7 +755,8 @@ void sbus_to_usart1(uint8_t *sbus)
 /******************************************************************/
 
 /**
-  * @brief          鑾峰彇閬ユ帶鍣ㄦ槸鍚︾绾裤€?  * @retval         true:绂荤嚎锛宖alse:鍦ㄧ嚎
+  * @brief          获取遥控器是否离线。
+  * @retval         true:离线，false:在线
   */
 inline bool GetRcOffline(void)
 {
@@ -569,6 +764,7 @@ inline bool GetRcOffline(void)
 #define USE_SBUS_LOST_COUNT 0
 #else
 #define USE_SBUS_LOST_COUNT 0
+// #define USE_SBUS_LOST_COUNT 0
 #endif
 
 #if __CONTROL_LINK_RC == CL_RC_DIRECT
@@ -586,16 +782,21 @@ inline bool GetRcOffline(void)
 }
 
 /**
-  * @brief          鑾峰彇DT7閬ユ帶鍣ㄩ€氶亾鍊笺€?  * @param[in]      ch 閫氶亾id锛?-鍙冲钩, 1-鍙崇珫, 2-宸﹀钩, 3-宸︾珫, 4-宸︽粴杞紝閰嶅悎ch id瀹忚繘琛屼娇鐢?  * @retval         DT7閬ユ帶鍣ㄩ€氶亾鍊硷紝鑼冨洿涓?[鈭?,1]
+  * @brief          获取DT7遥控器通道值。
+  * @param[in]      ch 通道id，0-右平, 1-右竖, 2-左平, 3-左竖, 4-左滚轮，配合ch id宏进行使用
+  * @retval         DT7遥控器通道值，范围为 [−1,1]
   */
 inline float GetDt7RcCh(uint8_t ch) { return rc_ctrl.rc.ch[ch] * RC_TO_ONE; }
 /**
-  * @brief          鑾峰彇DT7閬ユ帶鍣ㄦ嫧鏉嗗€硷紝鍙厤鍚坰witch_is_xxx绯诲垪瀹忓嚱鏁颁娇鐢ㄣ€?  * @param[in]      sw 閫氶亾id锛?-鍙? 1-宸︼紝閰嶅悎sw id瀹忚繘琛屼娇鐢?  * @retval         DT7閬ユ帶鍣ㄦ嫧鏉嗗€硷紝鑼冨洿涓簕1,2,3}
+  * @brief          获取DT7遥控器拨杆值，可配合switch_is_xxx系列宏函数使用。
+  * @param[in]      sw 通道id，0-右, 1-左，配合sw id宏进行使用
+  * @retval         DT7遥控器拨杆值，范围为{1,2,3}
   */
 inline char GetDt7RcSw(uint8_t sw) { return rc_ctrl.rc.s[sw]; }
 /**
-  * @brief          鑾峰彇榧犳爣axis杞寸殑绉诲姩閫熷害
-  * @param[in]      axis 杞磇d, 0-, 1-, 2-锛岄厤鍚堣酱id瀹忚繘琛屼娇鐢?  * @retval         榧犳爣axis杞寸Щ鍔ㄩ€熷害锛岃寖鍥翠负[,]
+  * @brief          获取鼠标axis轴的移动速度
+  * @param[in]      axis 轴id, 0-, 1-, 2-，配合轴id宏进行使用
+  * @retval         鼠标axis轴移动速度，范围为[,]
   */
 inline float GetDt7MouseSpeed(uint8_t axis)
 {
@@ -611,8 +812,10 @@ inline float GetDt7MouseSpeed(uint8_t axis)
     }
 }
 /**
-  * @brief          鑾峰彇榧犳爣鎸夐敭淇℃伅
-  * @param[in]      key 鎸夐敭id锛岄厤鍚堟寜閿甶d瀹忚繘琛屼娇鐢?  * @retval         榧犳爣鎸夐敭鏄惁琚寜涓?  */
+  * @brief          获取鼠标按键信息
+  * @param[in]      key 按键id，配合按键id宏进行使用
+  * @retval         鼠标按键是否被按下
+  */
 inline bool GetDt7Mouse(uint8_t key)
 {
     switch (key) {
@@ -625,9 +828,9 @@ inline bool GetDt7Mouse(uint8_t key)
     }
 }
 /**
-  * @brief          鑾峰彇閿洏鎸夐敭淇℃伅
-  * @param[in]      key 鎸夐敭id锛岄厤鍚堟寜閿甶d瀹忚繘琛屼娇鐢?  * @retval         閿洏鎸夐敭鏄惁琚寜涓?  */
+  * @brief          获取键盘按键信息
+  * @param[in]      key 按键id，配合按键id宏进行使用
+  * @retval         键盘按键是否被按下
+  */
 inline bool GetDt7Keyboard(uint8_t key) { return rc_ctrl.key.v & ((uint16_t)1 << key); }
 /*------------------------------ End of File ------------------------------*/
-
-

@@ -1,7 +1,7 @@
-﻿/**
+/**
   ****************************(C) COPYRIGHT 2024 Polarbear*************************
   * @file       usb_task.c/h
-  * @brief      閫氳繃USB涓插彛涓庝笂浣嶆満閫氫俊
+  * @brief      通过USB串口与上位机通信
   * @note
   * @history
   *  Version    Date            Author          Modification
@@ -71,29 +71,37 @@ static uint8_t USB_RX_BUF[USB_RX_DATA_SIZE];
 
 static const Imu_t * IMU;
 static const ChassisSpeedVector_t * FDB_SPEED_VECTOR;
+/*
 
-// USB connection state.
+// 判断USB连接状态用到的一些变量
+*/
 static bool USB_OFFLINE = true;
 static uint32_t RECEIVE_TIME = 0;
 static uint32_t LATEST_RX_TIMESTAMP = 0;
 static uint32_t CONTINUE_RECEIVE_CNT = 0;
 
-// 鏁版嵁鍙戦€佺粨鏋勪綋
+// 数据发送结构体
 // clang-format off
 static SendDataImu_s         SEND_DATA_IMU;
 static SendDataRobotMotion_s SEND_ROBOT_MOTION_DATA;
 
 // clang-format on
+/*
 
-// Receive frame storage.
+// 数据接收结构体
+*/
 static ReceiveDataRobotCmd_s RECEIVE_ROBOT_CMD_DATA;
 static ReceiveDataVirtualRc_s RECEIVE_VIRTUAL_RC_DATA;
+/*
 
-// Parsed robot command data.
+// 机器人控制指令数据
+*/
 RobotCmdData_t ROBOT_CMD_DATA;
 static RC_ctrl_t VIRTUAL_RC_CTRL;
+/*
 
-// USB send timestamps.
+// 发送数据间隔时间
+*/
 typedef struct
 {
     uint32_t Imu;
@@ -126,7 +134,8 @@ static void TranslateRobotCmdToRcCtrl(RC_ctrl_t * rc_ctrl, const RobotCmdData_t 
 /******************************************************************/
 
 /**
- * @brief      USB浠诲姟涓诲嚱鏁? * @param[in]  argument: 浠诲姟鍙傛暟
+ * @brief      USB任务主函数
+ * @param[in]  argument: 任务参数
  * @retval     None
  */
 void usb_task(void const * argument)
@@ -137,7 +146,9 @@ void usb_task(void const * argument)
 
     MX_USB_DEVICE_Init();
 
-    vTaskDelay(10);
+    vTaskDelay(10);  //等待USB设备初始化完成
+    UsbInit();
+
     UsbInit();
 
     while (1) {
@@ -170,16 +181,17 @@ void usb_task(void const * argument)
 /*******************************************************************************/
 
 /**
- * @brief      USB鍒濆鍖? * @param      None
+ * @brief      USB初始化
+ * @param      None
  * @retval     None
  */
 static void UsbInit(void)
 {
-    // 璁㈤槄鏁版嵁
-    IMU = Subscribe(IMU_NAME);                             // 鑾峰彇IMU鏁版嵁鎸囬拡
-    FDB_SPEED_VECTOR = Subscribe(CHASSIS_FDB_SPEED_NAME);  // 鑾峰彇搴曠洏閫熷害鐭㈤噺鎸囬拡
+    // 订阅数据
+    IMU = Subscribe(IMU_NAME);                             // 获取IMU数据指针
+    FDB_SPEED_VECTOR = Subscribe(CHASSIS_FDB_SPEED_NAME);  // 获取底盘速度矢量指针
 
-    // 鏁版嵁缃浂
+    // 数据置零
     memset(&LAST_SEND_TIME, 0, sizeof(LastSendTime_t));
     memset(&RECEIVE_ROBOT_CMD_DATA, 0, sizeof(ReceiveDataRobotCmd_s));
     memset(&RECEIVE_VIRTUAL_RC_DATA, 0, sizeof(ReceiveDataVirtualRc_s));
@@ -189,68 +201,74 @@ static void UsbInit(void)
     /*******************************************************************************/
     /* Serial                                                                     */
     /*******************************************************************************/    
-    // Initialize IMU frame header.
+    // 2.初始化IMU数据包
+    SEND_DATA_IMU.frame_header.sof = SEND_SOF;
     SEND_DATA_IMU.frame_header.sof = SEND_SOF;
     SEND_DATA_IMU.frame_header.len = (uint8_t)(sizeof(SendDataImu_s) - 6);
     SEND_DATA_IMU.frame_header.id = IMU_DATA_SEND_ID;
     append_CRC8_check_sum(
         (uint8_t *)(&SEND_DATA_IMU.frame_header), sizeof(SEND_DATA_IMU.frame_header));
+    append_CRC8_check_sum(  // 添加帧头 CRC8 校验位
+        (uint8_t *)(&SEND_DATA_IMU.frame_header), sizeof(SEND_DATA_IMU.frame_header));
     
-    // 8.鍒濆鍖栨満鍣ㄤ汉杩愬姩鏁版嵁
+    // 8.初始化机器人运动数据
     SEND_ROBOT_MOTION_DATA.frame_header.sof = SEND_SOF;
     SEND_ROBOT_MOTION_DATA.frame_header.len = (uint8_t)(sizeof(SendDataRobotMotion_s) - 6);
     SEND_ROBOT_MOTION_DATA.frame_header.id = ROBOT_MOTION_DATA_SEND_ID;
     append_CRC8_check_sum(
         (uint8_t *)(&SEND_ROBOT_MOTION_DATA.frame_header),
         sizeof(SEND_ROBOT_MOTION_DATA.frame_header));
+    append_CRC8_check_sum(  // 添加帧头 CRC8 校验位
+        (uint8_t *)(&SEND_ROBOT_MOTION_DATA.frame_header),
+        sizeof(SEND_ROBOT_MOTION_DATA.frame_header));
 }
 
 /**
- * @brief      鐢║SB鍙戦€佹暟鎹? * @param      None
+ * @brief      用USB发送数据
+ * @param      None
  * @retval     None
  */
 static void UsbSendData(void)
 {
-    // 鍙戦€両mu鏁版嵁
+    // 发送Imu数据
     CheckDurationAndSend(Imu);
-    // 鍙戦€丷obotMotion鏁版嵁
+    // 发送RobotMotion数据
     CheckDurationAndSend(RobotMotion);
 }
 
 /**
- * @brief      USB鎺ユ敹鏁版嵁
+ * @brief      USB接收数据
  * @param      None
  * @retval     None
  */
+#if 0
 static void UsbReceiveData(void)
 {
     static uint32_t len = USB_RECEIVE_LEN;
-    static uint8_t * rx_data_start_address = USB_RX_BUF;
-    static uint8_t * rx_data_end_address;
+    static uint8_t * rx_data_start_address = USB_RX_BUF;  // 接收数据包时存放于缓存区的起始位置
+    static uint8_t * rx_data_end_address;  // 接收数据包时存放于缓存区的结束位置
     uint8_t * sof_address = USB_RX_BUF;
-    uint8_t * rx_buffer_limit;
 
-    // Valid receive window: [rx_data_start_address, rx_data_start_address + USB_RECEIVE_LEN - 1].
-    rx_buffer_limit = rx_data_start_address + USB_RECEIVE_LEN;
-    rx_data_end_address = rx_buffer_limit - 1;
-    // 璇诲彇鏁版嵁
+    // 计算数据包的结束位置
+    rx_data_end_address = rx_data_start_address + USB_RECEIVE_LEN;
+    // 读取数据
     USB_Receive(rx_data_start_address, &len);  // Read data into the buffer
 
-    while (sof_address <= rx_data_end_address) {  // 瑙ｆ瀽缂撳啿鍖轰腑鐨勬墍鏈夋暟鎹寘
-        // 瀵绘壘甯уご浣嶇疆
-        while ((sof_address <= rx_data_end_address) && (*sof_address != RECEIVE_SOF)) {
+    while (sof_address <= rx_data_end_address) {  // 解析缓冲区中的所有数据包
+        // 寻找帧头位置
+        while (*(sof_address) != RECEIVE_SOF && (sof_address <= rx_data_end_address)) {
             sof_address++;
         }
-        // 鍒ゆ柇鏄惁瓒呭嚭鎺ユ敹鏁版嵁鑼冨洿
+        // 判断是否超出接收数据范围
         if (sof_address > rx_data_end_address) {
-            break;
+            break;  // 退出循环
         }
-        // 妫€鏌RC8鏍￠獙
+        // 检查CRC8校验
         bool crc8_ok = verify_CRC8_check_sum(sof_address, HEADER_SIZE);
         if (crc8_ok) {
             uint8_t data_len = sof_address[1];
             uint8_t data_id = sof_address[2];
-            // 妫€鏌ユ暣鍖匔RC16鏍￠獙 4: header size, 2: crc16 size
+            // 检查整包CRC16校验 4: header size, 2: crc16 size
             bool crc16_ok = verify_CRC16_check_sum(sof_address, 4 + data_len + 2);
             if (crc16_ok) {
                 switch (data_id) {
@@ -270,17 +288,77 @@ static void UsbReceiveData(void)
                 }
             }
             sof_address += (data_len + HEADER_SIZE + 2);
-        } else {  // CRC8 error: move to the next byte and continue searching.
+        } else {  //CRC8校验失败，移动到下一个字节
             sof_address++;
         }
     }
-    // 鏇存柊涓嬩竴娆℃帴鏀舵暟鎹殑璧峰浣嶇疆
+    // 更新下一次接收数据的起始位置
+    if (sof_address > rx_data_start_address + USB_RECEIVE_LEN) {
+        // 缓冲区中没有剩余数据，下次接收数据的起始位置为缓冲区的起始位置
+        rx_data_start_address = USB_RX_BUF;
+    } else {
+        uint16_t remaining_data_len = USB_RECEIVE_LEN - (sof_address - rx_data_start_address);
+        // 缓冲区中有剩余数据，下次接收数据的起始位置为缓冲区中剩余数据的起始位置
+        rx_data_start_address = USB_RX_BUF + remaining_data_len;
+        // 将剩余数据移到缓冲区的起始位置
+        memcpy(USB_RX_BUF, sof_address, remaining_data_len);
+    }
+}
+
+#endif
+
+static void UsbReceiveData(void)
+{
+    static uint32_t len = USB_RECEIVE_LEN;
+    static uint8_t * rx_data_start_address = USB_RX_BUF;
+    static uint8_t * rx_data_end_address;
+    uint8_t * sof_address = USB_RX_BUF;
+    uint8_t * rx_buffer_limit;
+
+    rx_buffer_limit = rx_data_start_address + USB_RECEIVE_LEN;
+    rx_data_end_address = rx_buffer_limit - 1;
+    USB_Receive(rx_data_start_address, &len);
+
+    while (sof_address <= rx_data_end_address) {
+        while ((sof_address <= rx_data_end_address) && (*sof_address != RECEIVE_SOF)) {
+            sof_address++;
+        }
+        if (sof_address > rx_data_end_address) {
+            break;
+        }
+
+        bool crc8_ok = verify_CRC8_check_sum(sof_address, HEADER_SIZE);
+        if (crc8_ok) {
+            uint8_t data_len = sof_address[1];
+            uint8_t data_id = sof_address[2];
+            bool crc16_ok = verify_CRC16_check_sum(sof_address, 4 + data_len + 2);
+            if (crc16_ok) {
+                switch (data_id) {
+                    case ROBOT_CMD_DATA_RECEIVE_ID: {
+                        memcpy(&RECEIVE_ROBOT_CMD_DATA, sof_address, sizeof(ReceiveDataRobotCmd_s));
+                    } break;
+                    case VIRTUAL_RC_DATA_RECEIVE_ID: {
+                        memcpy(
+                            &RECEIVE_VIRTUAL_RC_DATA, sof_address, sizeof(ReceiveDataVirtualRc_s));
+                    } break;
+                    default:
+                        break;
+                }
+                if (*((uint32_t *)(&sof_address[4])) > LATEST_RX_TIMESTAMP) {
+                    LATEST_RX_TIMESTAMP = *((uint32_t *)(&sof_address[4]));
+                    RECEIVE_TIME = HAL_GetTick();
+                }
+            }
+            sof_address += (data_len + HEADER_SIZE + 2);
+        } else {
+            sof_address++;
+        }
+    }
+
     if (sof_address >= rx_buffer_limit) {
-        // No remaining data: restart from the beginning of the USB RX buffer next time.
         rx_data_start_address = USB_RX_BUF;
     } else {
         uint16_t remaining_data_len = (uint16_t)(rx_buffer_limit - sof_address);
-        // Preserve the unparsed tail and append new USB data after it next cycle.
         rx_data_start_address = USB_RX_BUF + remaining_data_len;
         memcpy(USB_RX_BUF, sof_address, remaining_data_len);
     }
@@ -291,8 +369,9 @@ static void UsbReceiveData(void)
 /*******************************************************************************/
 
 /**
- * @brief 鍙戦€両MU鏁版嵁
- * @param duration 鍙戦€佸懆鏈? */
+ * @brief 发送IMU数据
+ * @param duration 发送周期
+ */
 static void UsbSendImuData(void)
 {
     if (IMU == NULL) {
@@ -314,8 +393,9 @@ static void UsbSendImuData(void)
 }
 
 /**
- * @brief 鍙戦€佹満鍣ㄤ汉杩愬姩鏁版嵁
- * @param duration 鍙戦€佸懆鏈? */
+ * @brief 发送机器人运动数据
+ * @param duration 发送周期
+ */
 static void UsbSendRobotMotionData(void)
 {
     if (FDB_SPEED_VECTOR == NULL) {
@@ -335,6 +415,25 @@ static void UsbSendRobotMotionData(void)
 /*******************************************************************************/
 /* Receive Function                                                            */
 /*******************************************************************************/
+
+#if 0
+static void GetCmdData(void)
+{
+    ROBOT_CMD_DATA.speed_vector.vx = RECEIVE_ROBOT_CMD_DATA.data.speed_vector.vx;
+    ROBOT_CMD_DATA.speed_vector.vy = RECEIVE_ROBOT_CMD_DATA.data.speed_vector.vy;
+    ROBOT_CMD_DATA.speed_vector.wz = RECEIVE_ROBOT_CMD_DATA.data.speed_vector.wz;
+
+    ROBOT_CMD_DATA.chassis.yaw = RECEIVE_ROBOT_CMD_DATA.data.chassis.yaw;
+    ROBOT_CMD_DATA.chassis.pitch = RECEIVE_ROBOT_CMD_DATA.data.chassis.pitch;
+    ROBOT_CMD_DATA.chassis.roll = RECEIVE_ROBOT_CMD_DATA.data.chassis.roll;
+    ROBOT_CMD_DATA.chassis.leg_length = RECEIVE_ROBOT_CMD_DATA.data.chassis.leg_lenth;
+}
+
+static void GetVirtualRcCtrlData(void)
+{
+    memcpy(&VIRTUAL_RC_CTRL, &RECEIVE_VIRTUAL_RC_DATA.data, sizeof(RC_ctrl_t));
+}
+#endif
 
 static void GetCmdData(void)
 {
@@ -386,7 +485,6 @@ static void TranslateRobotCmdToRcCtrl(RC_ctrl_t * rc_ctrl, const RobotCmdData_t 
 {
     memset(rc_ctrl, 0, sizeof(RC_ctrl_t));
 
-    // Translate 0x01 commands into the RC semantics that select normal balanced motion.
     rc_ctrl->rc.s[CHASSIS_MODE_CHANNEL] = RC_SW_MID;
     rc_ctrl->rc.s[CHASSIS_FUNCTION] = RC_SW_DOWN;
 
@@ -395,8 +493,6 @@ static void TranslateRobotCmdToRcCtrl(RC_ctrl_t * rc_ctrl, const RobotCmdData_t 
     rc_ctrl->rc.ch[CHASSIS_WZ_CHANNEL] =
         UsbSpeedToRcChannel(-robot_cmd->speed_vector.wz, MAX_SPEED_VECTOR_WZ);
 
-    // In the current chassis RC framework, BIPEDAL mode only consumes tail on ch[1].
-    // Keep it neutral so a 0x01 packet does not introduce an unintended tail command.
     rc_ctrl->rc.ch[CHASSIS_TAIL_POS_CHANNEL] = 0;
 }
 
@@ -411,8 +507,9 @@ bool GetUsbRcOffline(void) { return GetUsbOffline(); }
 const RC_ctrl_t * GetUsbVirtualRcCtrl(void) { return &VIRTUAL_RC_CTRL; }
 
 /**
- * @brief 鑾峰彇涓婁綅鏈烘帶鍒舵寚浠わ細搴曠洏鍧愭爣绯讳笅axis鏂瑰悜杩愬姩绾块€熷害
- * @param axis 杞磇d锛屽彲閰嶅悎瀹氫箟濂界殑杞磇d瀹忎娇鐢? * @return float (m/s) 搴曠洏鍧愭爣绯讳笅axis鏂瑰悜杩愬姩绾块€熷害
+ * @brief 获取上位机控制指令：底盘坐标系下axis方向运动线速度
+ * @param axis 轴id，可配合定义好的轴id宏使用
+ * @return float (m/s) 底盘坐标系下axis方向运动线速度
  */
 inline float GetScCmdChassisSpeed(uint8_t axis)
 {
@@ -432,8 +529,9 @@ inline float GetScCmdChassisSpeed(uint8_t axis)
 }
 
 /**
- * @brief 鑾峰彇涓婁綅鏈烘帶鍒舵寚浠わ細搴曠洏鍧愭爣绯讳笅axis鏂瑰悜杩愬姩瑙掗€熷害
- * @param axis 杞磇d锛屽彲閰嶅悎瀹氫箟濂界殑杞磇d瀹忎娇鐢? * @return float (rad/s) 搴曠洏鍧愭爣绯讳笅axis鏂瑰悜杩愬姩瑙掗€熷害
+ * @brief 获取上位机控制指令：底盘坐标系下axis方向运动角速度
+ * @param axis 轴id，可配合定义好的轴id宏使用
+ * @return float (rad/s) 底盘坐标系下axis方向运动角速度
  */
 inline float GetScCmdChassisVelocity(uint8_t axis)
 {
@@ -446,12 +544,12 @@ inline float GetScCmdChassisVelocity(uint8_t axis)
 
 
 /**
- * @brief 鑾峰彇涓婁綅鏈烘帶鍒舵寚浠わ細搴曠洏绂诲湴楂樺害锛屽钩琛″簳鐩樹腑鍙敤浣滆吙闀垮弬鏁? * @param void
- * @return (m) 搴曠洏绂诲湴楂樺害
+ * @brief 获取上位机控制指令：底盘离地高度，平衡底盘中可用作腿长参数
+ * @param void
+ * @return (m) 底盘离地高度
  */
 inline float GetScCmdChassisHeight(void)
 {
     return ROBOT_CMD_DATA.chassis.leg_length;
 }
 /*------------------------------ End of File ------------------------------*/
-

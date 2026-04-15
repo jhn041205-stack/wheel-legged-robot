@@ -25,6 +25,7 @@
 #include "chassis_balance.h"
 
 #include "CAN_communication.h"
+#include "clamp_control.h"
 #include "IMU.h"
 #include "bsp_delay.h"
 #include "chassis.h"
@@ -808,6 +809,18 @@ static float WrapToPi(float a)
     return a;
 }
 
+static uint8_t ClampRcToStep(int16_t rc_value)
+{
+    float normalized = fabsf((float)rc_value) * RC_TO_ONE;
+    float step = normalized * 6.0f;
+
+    if (step < 1.0f) {
+        step = 1.0f;
+    }
+
+    return (uint8_t)fp32_constrain(step + 0.5f, 1.0f, 12.0f);
+}
+
 /**
  * @brief          更新目标量
  * @param[in]      none
@@ -818,6 +831,7 @@ void ChassisReference(void)
     int16_t rc_x = 0, rc_wz = 0;
     int16_t rc_length = 0, rc_angle = 0, rc_tail = 0;
     int16_t rc_roll = 0, rc_pitch = 0;
+    int16_t rc_hand = 0;
 
     // 0-右平, 1-右竖, 2-左平, 3-左竖, 4-左滚轮
     rc_deadband_limit(CHASSIS.rc->rc.ch[CHASSIS_X_CHANNEL], rc_x, CHASSIS_RC_DEADLINE);    //3
@@ -836,8 +850,8 @@ void ChassisReference(void)
     } else if (switch_is_down(CHASSIS.rc->rc.s[CHASSIS_FUNCTION])) {
         rc_deadband_limit(
             CHASSIS.rc->rc.ch[CHASSIS_TAIL_POS_CHANNEL], rc_tail, CHASSIS_RC_DEADLINE);  //1
-        // rc_deadband_limit(
-        //     CHASSIS.rc->rc.ch[CHASSIS_HAND_CHANNEL], rc_hand, CHASSIS_RC_DEADLINE);  //0 夹爪
+        rc_deadband_limit(
+            CHASSIS.rc->rc.ch[CHASSIS_HAND_CHANNEL], rc_hand, CHASSIS_RC_DEADLINE);  //0 夹爪
     }
 
     // 计算速度向量
@@ -953,6 +967,32 @@ void ChassisReference(void)
     CHASSIS.ref.tail_state.beta        =  tail_angle;
     CHASSIS.ref.tail_state.beta_dot    =  0;
     // clang-format on
+
+    // 夹爪目标量：仅在模式开关和功能开关都拨到下时启用相对控制。
+    // 右拨增加开合目标位置，左拨减小开合目标位置，回中保持当前位置不变。
+    static uint8_t clamp_target_position = 0x80;
+    static bool clamp_target_valid = false;
+
+    if (switch_is_down(CHASSIS.rc->rc.s[CHASSIS_MODE_CHANNEL]) &&
+        switch_is_down(CHASSIS.rc->rc.s[CHASSIS_FUNCTION])) {
+        if (!clamp_target_valid) {
+            clamp_target_valid = true;
+        }
+
+        if (rc_hand != 0) {
+            uint8_t step = ClampRcToStep(rc_hand);
+
+            if (rc_hand > 0) {
+                clamp_target_position = (uint8_t)fp32_constrain(
+                    (float)clamp_target_position + step, 0.0f, 255.0f);
+            } else {
+                clamp_target_position = (uint8_t)fp32_constrain(
+                    (float)clamp_target_position - step, 0.0f, 255.0f);
+            }
+
+            ClampSetTarget(clamp_target_position, 0xFF, 0xFF);
+        }
+    }
 }
 
 /******************************************************************/

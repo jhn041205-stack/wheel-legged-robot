@@ -14,10 +14,11 @@
   ****************************(C) COPYRIGHT 2024 Polarbear****************************
 */
 #include "uart_receive.h"
+#include "clamp_control.h"
 #include "usart.h"
 
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+__weak void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     if (huart->Instance == USART1) {
-        // 接收成功，处理接收到的数据
+    ClampUartOnReceiveComplete(huart);
     }
 }
