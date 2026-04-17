@@ -80,6 +80,7 @@ static void imu_rotate(fp32 gyro[3], fp32 accel[3], fp32 mag[3], bmi088_real_dat
 static void board_rotate(fp32 gyro[3], fp32 accel[3]);
 
 static void UpdateImuData(void);
+static void ResetImuSolver(void);
 
 extern SPI_HandleTypeDef hspi1;
 
@@ -135,6 +136,8 @@ fp32 INS_angle_last[3] = {0.0f, 0.0f, 0.0f};
 // clang-format on
 
 static Imu_t IMU_DATA = {0.0f};
+static volatile uint8_t imu_reset_request_flag = 0;
+static volatile uint8_t imu_resetting_flag = 0;
 
 static fp32 board_rotate_matrix[3][3] = {__BOARD_INSTALL_SPIN_MATRIX};
 
@@ -220,6 +223,10 @@ void IMU_task(void const * pvParameters)
         imu_rotate(INS_gyro, INS_accel, INS_mag, &bmi088_real_data, &ist8310_real_data);
         board_rotate(INS_gyro, INS_accel);
 
+        if (imu_reset_request_flag) {
+            ResetImuSolver();
+        }
+
         // 更新加速度
         gEstimateKF_Update(INS_gyro[0],  INS_gyro[1],  INS_gyro[2],
                            INS_accel[0], INS_accel[1], INS_accel[2],
@@ -231,7 +238,17 @@ void IMU_task(void const * pvParameters)
         // clang-format on
 
         UpdateImuData();
+        imu_resetting_flag = 0;
     }
+}
+
+static void ResetImuSolver(void)
+{
+    imu_reset_request_flag = 0;
+    imu_resetting_flag = 1;
+
+    gEstimateKF_Init(1, 2000);
+    IMU_QuaternionEKF_Init(10, 0.001, 1000000, 0.9996);
 }
 
 static void UpdateImuData(void)
@@ -570,6 +587,10 @@ inline float GetImuAccel(uint8_t axis) { return IMU_DATA.accel[axis]; }
   * @retval         (rad/s) yaw零飘修正值
   */
 float GetYawBias(void) { return IMU_DATA.gyro[AX_Z]; }
+
+void ImuRequestReset(void) { imu_reset_request_flag = 1; }
+
+uint8_t ImuIsResetting(void) { return imu_resetting_flag; }
 
 float get_raw_accel(uint8_t axis)
 {
