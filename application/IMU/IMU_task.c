@@ -249,6 +249,22 @@ static void ResetImuSolver(void)
 
     gEstimateKF_Init(1, 2000);
     IMU_QuaternionEKF_Init(10, 0.001, 1000000, 0.9996);
+
+    INS.q[0] = 1.0f;
+    INS.q[1] = 0.0f;
+    INS.q[2] = 0.0f;
+    INS.q[3] = 0.0f;
+
+    for (uint8_t i = 0; i < 3; i++) {
+        INS.GyroBias[i] = 0.0f;
+        INS.angle[i] = 0.0f;
+        INS_angle[i] = 0.0f;
+        INS_angle_last[i] = 0.0f;
+        gVec[i] = 0.0f;
+        IMU_DATA.angle[i] = 0.0f;
+        IMU_DATA.gyro[i] = 0.0f;
+        IMU_DATA.accel[i] = 0.0f;
+    }
 }
 
 static void UpdateImuData(void)
