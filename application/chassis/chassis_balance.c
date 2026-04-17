@@ -48,6 +48,9 @@
 #define CLOSE_LEG_RIGHT 0  // 关闭右腿输出
 #define LIFTED_UP 0        // 被架起
 #define PRO_CONTROLLER 1   //
+#define MOTOR_RESET_STABLE_TIME_MS 40
+#define MOTOR_RESET_COOLDOWN_TIME_MS 500
+#define CHASSIS_RESET_HOLD_CYCLES 5
 
 // Parameters on ---------------------
 #define MS_TO_S 0.001f
@@ -97,6 +100,11 @@
 static Observer_t OBSERVER;
 static ChassisSolvedRcCmd_t CHASSIS_SOLVED_RC_CMD;
 static void UpdateChassisSolvedRcCmd(void);
+static uint8_t GetChassisMotorOfflineMask(void);
+static void CheckMotorOfflineStatusChange(void);
+static void ChassisControlReset(void);
+static void ClearChassisPidState(void);
+static void ResetBodyVelocityObserverState(void);
 
 Chassis_s CHASSIS = {
     .mode = CHASSIS_OFF,
@@ -108,6 +116,7 @@ Chassis_s CHASSIS = {
 int8_t TRANSITION_MATRIX[10] = {0};
 
 float last_dBeta;
+static uint8_t chassis_reset_hold_count = 0;
 
 /*-------------------- Publish --------------------*/
 
@@ -381,6 +390,12 @@ void ChassisSetMode(void)
         CHASSIS.mode = CHASSIS_SAFE;
         return;
     }
+
+    if (chassis_reset_hold_count > 0) {
+        chassis_reset_hold_count--;
+        CHASSIS.mode = CHASSIS_SAFE;
+        return;
+    }
 #if TAKE_OFF_DETECT
     // 离地状态切换
     for (uint8_t i = 0; i < 2; i++) {
@@ -444,6 +459,7 @@ void ChassisObserver(void)
     UpdateStepStatus();
 
     BodyMotionObserve();
+    CheckMotorOfflineStatusChange();
 }
 
 /**
@@ -461,6 +477,158 @@ static void UpdateMotorStatus(void)
     }
 
     GetMotorMeasure(&CHASSIS.tail_motor);
+}
+
+static uint8_t GetChassisMotorOfflineMask(void)
+{
+    uint8_t mask = 0;
+
+    for (uint8_t i = 0; i < 4; i++) {
+        if (CHASSIS.joint_motor[i].offline) {
+            mask |= (uint8_t)(1 << i);
+        }
+    }
+
+    for (uint8_t i = 0; i < 2; i++) {
+        if (CHASSIS.wheel_motor[i].offline) {
+            mask |= (uint8_t)(1 << (i + 4));
+        }
+    }
+
+    if (CHASSIS.tail_motor.offline) {
+        mask |= (uint8_t)(1 << 6);
+    }
+
+    return mask;
+}
+
+static void CheckMotorOfflineStatusChange(void)
+{
+    static uint8_t initialized = 0;
+    static uint8_t last_stable_mask = 0;
+    static uint8_t pending_mask = 0;
+    static uint8_t pending_change = 0;
+    static uint32_t pending_time = 0;
+    static uint32_t last_reset_time = 0;
+
+    uint32_t now = xTaskGetTickCount();
+    uint8_t current_mask = GetChassisMotorOfflineMask();
+
+    if (!initialized) {
+        initialized = 1;
+        last_stable_mask = current_mask;
+        return;
+    }
+
+    if (current_mask == last_stable_mask) {
+        pending_change = 0;
+        return;
+    }
+
+    if (!pending_change || pending_mask != current_mask) {
+        pending_change = 1;
+        pending_mask = current_mask;
+        pending_time = now;
+        return;
+    }
+
+    if (now - pending_time < MOTOR_RESET_STABLE_TIME_MS) {
+        return;
+    }
+
+    pending_change = 0;
+    last_stable_mask = current_mask;
+
+    if (last_reset_time != 0 && now - last_reset_time < MOTOR_RESET_COOLDOWN_TIME_MS) {
+        return;
+    }
+
+    last_reset_time = now;
+    ChassisControlReset();
+}
+
+static void ClearChassisPidState(void)
+{
+    PID_clear(&CHASSIS.pid.yaw_angle);
+    PID_clear(&CHASSIS.pid.yaw_velocity);
+    PID_clear(&CHASSIS.pid.vel_add);
+    PID_clear(&CHASSIS.pid.roll_angle);
+    PID_clear(&CHASSIS.pid.pitch_angle);
+
+#if LOCATION_CONTROL
+    PID_clear(&CHASSIS.pid.pitch_vel);
+#else
+    PID_clear(&CHASSIS.pid.leg_length_length[0]);
+    PID_clear(&CHASSIS.pid.leg_length_length[1]);
+    PID_clear(&CHASSIS.pid.leg_length_speed[0]);
+    PID_clear(&CHASSIS.pid.leg_length_speed[1]);
+    PID_clear(&CHASSIS.pid.leg_angle_angle);
+    PID_clear(&CHASSIS.pid.leg_coordation);
+    PID_clear(&CHASSIS.pid.theta_comp);
+#endif
+
+    PID_clear(&CHASSIS.pid.tail_comp);
+    PID_clear(&CHASSIS.pid.tail_up);
+    PID_clear(&CHASSIS.pid.tail_z);
+    PID_clear(&CHASSIS.pid.stand_up);
+    PID_clear(&CHASSIS.pid.wheel_stop[0]);
+    PID_clear(&CHASSIS.pid.wheel_stop[1]);
+}
+
+static void ResetBodyVelocityObserverState(void)
+{
+    float P[4] = {100000, 0, 0, 100000};
+
+    memset(OBSERVER.body.v_kf.xhat_data, 0, sizeof(float) * 2);
+    memset(OBSERVER.body.v_kf.xhatminus_data, 0, sizeof(float) * 2);
+    memset(OBSERVER.body.v_kf.FilteredValue, 0, sizeof(float) * 2);
+    memset(OBSERVER.body.v_kf.MeasuredVector, 0, sizeof(float) * 2);
+    memcpy(OBSERVER.body.v_kf.P_data, P, sizeof(P));
+    memcpy(OBSERVER.body.v_kf.Pminus_data, P, sizeof(P));
+}
+
+static void ChassisControlReset(void)
+{
+    ImuRequestReset();
+    ClearChassisPidState();
+    ResetBodyVelocityObserverState();
+
+    memset(&CHASSIS.cmd, 0, sizeof(CHASSIS.cmd));
+    memset(&CHASSIS.ref, 0, sizeof(CHASSIS.ref));
+
+    for (uint8_t i = 0; i < 4; i++) {
+        memset(&CHASSIS.joint_motor[i].set, 0, sizeof(CHASSIS.joint_motor[i].set));
+    }
+    for (uint8_t i = 0; i < 2; i++) {
+        memset(&CHASSIS.wheel_motor[i].set, 0, sizeof(CHASSIS.wheel_motor[i].set));
+    }
+    memset(&CHASSIS.tail_motor.set, 0, sizeof(CHASSIS.tail_motor.set));
+
+    CHASSIS.fdb.body.x = 0.0f;
+    CHASSIS.fdb.body.x_dot_obv = 0.0f;
+    CHASSIS.fdb.body.x_acc_obv = 0.0f;
+    CHASSIS.step = NORMAL_STEP;
+    CHASSIS.step_time = 0;
+    last_dBeta = CHASSIS.fdb.tail.dBeta;
+
+    for (uint8_t i = 0; i < 2; i++) {
+        CHASSIS.fdb.leg_state[i].Delta_theta = 0.0f;
+        CHASSIS.fdb.leg_state[i].Delta_theta_dot = 0.0f;
+        CHASSIS.fdb.leg_state[i].Delta_x = 0.0f;
+        CHASSIS.fdb.leg_state[i].Delta_x_dot = 0.0f;
+        CHASSIS.fdb.leg_state[i].Delta_phi = 0.0f;
+        CHASSIS.fdb.leg_state[i].Delta_phi_dot = 0.0f;
+        CHASSIS.fdb.leg_state[i].last_theta = CHASSIS.fdb.leg_state[i].theta;
+        CHASSIS.fdb.leg_state[i].last_theta_dot = CHASSIS.fdb.leg_state[i].theta_dot;
+        CHASSIS.fdb.leg_state[i].last_x = 0.0f;
+        CHASSIS.fdb.leg_state[i].last_x_dot = 0.0f;
+        CHASSIS.fdb.leg_state[i].last_phi = CHASSIS.fdb.leg_state[i].phi;
+        CHASSIS.fdb.leg_state[i].last_phi_dot = CHASSIS.fdb.leg_state[i].phi_dot;
+    }
+
+    CHASSIS.ref.body.yaw = 0.0f;
+    CHASSIS.mode = CHASSIS_SAFE;
+    chassis_reset_hold_count = CHASSIS_RESET_HOLD_CYCLES;
 }
 
 static void UpdateBodyStatus(void)  //主要是imu和磁力计那些
