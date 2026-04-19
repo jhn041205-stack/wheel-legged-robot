@@ -2,6 +2,7 @@
 #define USB_TYPEDEF_H
 
 #include "attribute_typedef.h"
+#include "custom_typedef.h"
 #include "remote_control.h"
 #include "struct_typedef.h"
 
@@ -16,6 +17,7 @@
 #define IMU_DATA_SEND_ID          ((uint8_t)0x02)
 #define ROBOT_MOTION_DATA_SEND_ID ((uint8_t)0x08)
 #define ROBOT_STATUS_SEND_ID      ((uint8_t)0x0B)
+#define SOLVED_RC_CMD_DATA_SEND_ID ((uint8_t)0x0C)
 
 #define ROBOT_CMD_DATA_RECEIVE_ID  ((uint8_t)0x01)
 #define VIRTUAL_RC_DATA_RECEIVE_ID ((uint8_t)0x03)
@@ -83,6 +85,14 @@ typedef struct
     } __packed__ data;
     uint16_t crc;
 } __packed__ SendDataRobotStatus_s;
+
+typedef struct
+{
+    FrameHeader_t frame_header;  // data id = 0x0C
+    uint32_t time_stamp;
+    ChassisSolvedRcCmd_t data;
+    uint16_t crc;
+} __packed__ SendDataSolvedRcCmd_s;
 
 /*-------------------- Receive --------------------*/
 typedef struct RobotCmdData

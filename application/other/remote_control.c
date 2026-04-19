@@ -22,7 +22,7 @@
       AT9S PRO 遥控器中值为 1000
       HT8A 遥控器中值为 992
       ET08A 遥控器中值为 1024
-
+  
   ET08A 遥控器设置指南：
     1. 设置 主菜单->系统设置->摇杆模式 为模式2
     2. 设置 主菜单->通用功能->通道设置 5通道为 [辅助1 SB --] 6通道为 [辅助2 SC --]
@@ -82,7 +82,7 @@ static void Ht8aSbusToRc(volatile const uint8_t *sbus_buf, RC_ctrl_t *rc_ctrl);
 static void Et08aSbusToRc(volatile const uint8_t *sbus_buf, RC_ctrl_t *rc_ctrl);
 #endif
 
-//remote control data
+//remote control data 
 //遥控器控制变量
 RC_ctrl_t rc_ctrl;
 RC_ctrl_t rc_ctrl;
@@ -172,7 +172,6 @@ static void RefreshActiveRcCtrl(void)
     bool usb_control_selected =
         (raw_rc_ctrl.rc.s[CHASSIS_MODE_CHANNEL] == RC_SW_DOWN) &&
         (raw_rc_ctrl.rc.s[CHASSIS_FUNCTION] == RC_SW_MID);
-
     if (usb_control_selected) {
         if (GetUsbOffline()) {
             SetUsbZeroRcCtrl(&rc_ctrl);
@@ -341,7 +340,7 @@ void USART3_IRQHandler(void)
             {
                 //处理遥控器数据
                 sbus_to_rc(sbus_rx_buf[0], &rc_ctrl);
-
+                
                 COUNT_RECEIVED
                 memcpy(&raw_rc_ctrl, &rc_ctrl, sizeof(RC_ctrl_t));
                 RefreshActiveRcCtrl();
@@ -351,7 +350,7 @@ void USART3_IRQHandler(void)
                 RefreshActiveRcCtrl();
                 memcpy(&raw_rc_ctrl, &rc_ctrl, sizeof(RC_ctrl_t));
                 RefreshActiveRcCtrl();
-
+                
                 //记录数据接收时间
                 last_receive_time = HAL_GetTick();
                 detect_hook(DBUS_TOE);
@@ -402,7 +401,7 @@ void USART3_IRQHandler(void)
             {
                 //处理遥控器数据
                 sbus_to_rc(sbus_rx_buf[1], &rc_ctrl);
-
+                
                 COUNT_RECEIVED
 
                 //记录数据接收时间
@@ -420,7 +419,7 @@ void USART3_IRQHandler(void)
 #elif (__RC_TYPE == RC_ET08A)
                 Et08aSbusToRc(sbus_rx_buf[1], &rc_ctrl);
 #endif
-
+                
                 COUNT_RECEIVED
 
                 //记录数据接收时间

@@ -12,7 +12,7 @@
 #include <string.h>
 
 #include "bsp_uart.h"
-#include "cmsis_os.h"
+#include "cmsis_os.h"  
 
 #define CLAMP_UART_RX_MAX_LEN 16
 #define CLAMP_INIT_TOTAL_TIMEOUT_MS 5000
@@ -548,7 +548,7 @@ void Clampcontrol(void)
         if (clamp_target_pending == 0) {
             break;
         }
-
+        
         __disable_irq();
         target_position = clamp_target_position;
         target_force = clamp_target_force;
@@ -567,7 +567,7 @@ void Clampcontrol(void)
         clamp_active_speed = target_speed;
 
         ClampSendFrame(clamp_cmd_target, clamp_cmd_target_len);
-
+        
         clamp_stage_deadline_tick = now_tick + CLAMP_CTRL_ACK_TIMEOUT_MS;
         clamp_ctrl_state = CLAMP_CTRL_WAIT_ACK;
         break;

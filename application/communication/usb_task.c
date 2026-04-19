@@ -51,6 +51,7 @@ uint32_t usb_high_water;
 #define SEND_DURATION_RobotStateInfo   10  // ms
 #define SEND_DURATION_RobotMotion 10  // ms
 #define SEND_DURATION_RobotStatus  10// ms
+#define SEND_DURATION_SolvedRcCmd 10  // ms
 
 // clang-format on
 
@@ -60,8 +61,8 @@ uint32_t usb_high_water;
 
 #define CheckDurationAndSend(send_name)                                                  \
     do {                                                                                 \
-        if ((HAL_GetTick() - LAST_SEND_TIME.##send_name) >= SEND_DURATION_##send_name) { \
-            LAST_SEND_TIME.##send_name = HAL_GetTick();                                  \
+        if ((HAL_GetTick() - LAST_SEND_TIME.send_name) >= SEND_DURATION_##send_name) {   \
+            LAST_SEND_TIME.send_name = HAL_GetTick();                                    \
             UsbSend##send_name##Data();                                                  \
         }                                                                                \
     } while (0)
@@ -71,6 +72,7 @@ static uint8_t USB_RX_BUF[USB_RX_DATA_SIZE];
 
 static const Imu_t * IMU;
 static const ChassisSpeedVector_t * FDB_SPEED_VECTOR;
+static const ChassisSolvedRcCmd_t * SOLVED_RC_CMD;
 /*
 
 // 判断USB连接状态用到的一些变量
@@ -84,6 +86,7 @@ static uint32_t CONTINUE_RECEIVE_CNT = 0;
 // clang-format off
 static SendDataImu_s         SEND_DATA_IMU;
 static SendDataRobotMotion_s SEND_ROBOT_MOTION_DATA;
+static SendDataSolvedRcCmd_s SEND_SOLVED_RC_CMD_DATA;
 
 // clang-format on
 /*
@@ -106,6 +109,7 @@ typedef struct
 {
     uint32_t Imu;
     uint32_t RobotMotion;
+    uint32_t SolvedRcCmd;
 } LastSendTime_t;
 static LastSendTime_t LAST_SEND_TIME;
 
@@ -121,6 +125,7 @@ static void UsbInit(void);
 /*******************************************************************************/
 static void UsbSendImuData(void);
 static void UsbSendRobotMotionData(void);
+static void UsbSendSolvedRcCmdData(void);
 
 /*******************************************************************************/
 /* Receive Function                                                            */
@@ -192,6 +197,8 @@ static void UsbInit(void)
     FDB_SPEED_VECTOR = Subscribe(CHASSIS_FDB_SPEED_NAME);  // 获取底盘速度矢量指针
 
     // 数据置零
+    SOLVED_RC_CMD = Subscribe(CHASSIS_SOLVED_RC_CMD_NAME);
+
     memset(&LAST_SEND_TIME, 0, sizeof(LastSendTime_t));
     memset(&RECEIVE_ROBOT_CMD_DATA, 0, sizeof(ReceiveDataRobotCmd_s));
     memset(&RECEIVE_VIRTUAL_RC_DATA, 0, sizeof(ReceiveDataVirtualRc_s));
@@ -221,7 +228,15 @@ static void UsbInit(void)
     append_CRC8_check_sum(  // 添加帧头 CRC8 校验位
         (uint8_t *)(&SEND_ROBOT_MOTION_DATA.frame_header),
         sizeof(SEND_ROBOT_MOTION_DATA.frame_header));
-}
+
+    SEND_SOLVED_RC_CMD_DATA.frame_header.sof = SEND_SOF;
+    SEND_SOLVED_RC_CMD_DATA.frame_header.len =
+        (uint8_t)(sizeof(SendDataSolvedRcCmd_s) - 6);
+    SEND_SOLVED_RC_CMD_DATA.frame_header.id = SOLVED_RC_CMD_DATA_SEND_ID;
+    append_CRC8_check_sum(
+        (uint8_t *)(&SEND_SOLVED_RC_CMD_DATA.frame_header),
+        sizeof(SEND_SOLVED_RC_CMD_DATA.frame_header));
+}   
 
 /**
  * @brief      用USB发送数据
@@ -234,6 +249,7 @@ static void UsbSendData(void)
     CheckDurationAndSend(Imu);
     // 发送RobotMotion数据
     CheckDurationAndSend(RobotMotion);
+    CheckDurationAndSend(SolvedRcCmd);
 }
 
 /**
@@ -410,6 +426,24 @@ static void UsbSendRobotMotionData(void)
 
     append_CRC16_check_sum((uint8_t *)&SEND_ROBOT_MOTION_DATA, sizeof(SendDataRobotMotion_s));
     USB_Transmit((uint8_t *)&SEND_ROBOT_MOTION_DATA, sizeof(SendDataRobotMotion_s));
+}
+
+static void UsbSendSolvedRcCmdData(void)
+{
+    if (SOLVED_RC_CMD == NULL) {
+        SOLVED_RC_CMD = Subscribe(CHASSIS_SOLVED_RC_CMD_NAME);
+        if (SOLVED_RC_CMD == NULL) {
+            return;
+        }
+    }
+
+    SEND_SOLVED_RC_CMD_DATA.time_stamp = HAL_GetTick();
+    memcpy(
+        &SEND_SOLVED_RC_CMD_DATA.data, SOLVED_RC_CMD, sizeof(ChassisSolvedRcCmd_t));
+
+    append_CRC16_check_sum(
+        (uint8_t *)&SEND_SOLVED_RC_CMD_DATA, sizeof(SendDataSolvedRcCmd_s));
+    USB_Transmit((uint8_t *)&SEND_SOLVED_RC_CMD_DATA, sizeof(SendDataSolvedRcCmd_s));
 }
 
 /*******************************************************************************/

@@ -48,6 +48,11 @@
 #define CLOSE_LEG_RIGHT 0  // 关闭右腿输出
 #define LIFTED_UP 0        // 被架起
 #define PRO_CONTROLLER 1   //
+#define MOTOR_RESET_STABLE_TIME_MS 40
+#define MOTOR_RESET_COOLDOWN_TIME_MS 500
+#define CHASSIS_RESET_HOLD_CYCLES 5
+#define CHASSIS_REFERENCE_DEFAULT_LENGTH 0.16f
+#define CHASSIS_CLAMP_DEFAULT_POSITION 0x80
 
 // Parameters on ---------------------
 #define MS_TO_S 0.001f
@@ -95,6 +100,17 @@
     }
 
 static Observer_t OBSERVER;
+static ChassisSolvedRcCmd_t CHASSIS_SOLVED_RC_CMD;
+static void UpdateChassisSolvedRcCmd(void);
+static uint8_t GetChassisMotorOfflineMask(void);
+static void CheckMotorOfflineStatusChange(void);
+static void ChassisControlReset(void);
+static void ResetChassisPidConfig(void);
+static void ResetChassisFilters(void);
+static void ResetBodyVelocityObserverConfig(void);
+static void ResetChassisReferenceState(void);
+static void ResetChassisFeedbackState(void);
+static void ResetChassisMotorCmd(void);
 
 Chassis_s CHASSIS = {
     .mode = CHASSIS_OFF,
@@ -106,10 +122,40 @@ Chassis_s CHASSIS = {
 int8_t TRANSITION_MATRIX[10] = {0};
 
 float last_dBeta;
+static uint8_t chassis_reset_hold_count = 0;
+static float chassis_ref_angle = 0.0f;
+static float chassis_ref_tail_angle = 0.0f;
+static float chassis_ref_length = CHASSIS_REFERENCE_DEFAULT_LENGTH;
+static uint8_t chassis_clamp_target_position = CHASSIS_CLAMP_DEFAULT_POSITION;
+static bool chassis_clamp_target_valid = false;
 
 /*-------------------- Publish --------------------*/
 
-void ChassisPublish(void) { Publish(&CHASSIS.fdb.speed_vector, CHASSIS_FDB_SPEED_NAME); }
+void ChassisPublish(void)
+{
+    Publish(&CHASSIS.fdb.speed_vector, CHASSIS_FDB_SPEED_NAME);
+    Publish(&CHASSIS_SOLVED_RC_CMD, CHASSIS_SOLVED_RC_CMD_NAME);
+}
+
+static void UpdateChassisSolvedRcCmd(void)
+{
+    CHASSIS_SOLVED_RC_CMD.mode = (uint8_t)CHASSIS.mode;
+    CHASSIS_SOLVED_RC_CMD.step = (uint8_t)CHASSIS.step;
+    CHASSIS_SOLVED_RC_CMD.rc_offline = (uint8_t)GetRcOffline();
+    CHASSIS_SOLVED_RC_CMD.reserved = 0;
+
+    CHASSIS_SOLVED_RC_CMD.vx = CHASSIS.ref.speed_vector.vx;
+    CHASSIS_SOLVED_RC_CMD.vy = CHASSIS.ref.speed_vector.vy;
+    CHASSIS_SOLVED_RC_CMD.wz = CHASSIS.ref.speed_vector.wz;
+    CHASSIS_SOLVED_RC_CMD.roll = CHASSIS.ref.body.roll;
+    CHASSIS_SOLVED_RC_CMD.pitch = CHASSIS.ref.body.pitch;
+    CHASSIS_SOLVED_RC_CMD.yaw = CHASSIS.ref.body.yaw;
+    CHASSIS_SOLVED_RC_CMD.leg_length_l = CHASSIS.ref.rod_L0[0];
+    CHASSIS_SOLVED_RC_CMD.leg_length_r = CHASSIS.ref.rod_L0[1];
+    CHASSIS_SOLVED_RC_CMD.leg_angle_l = CHASSIS.ref.rod_Angle[0];
+    CHASSIS_SOLVED_RC_CMD.leg_angle_r = CHASSIS.ref.rod_Angle[1];
+    CHASSIS_SOLVED_RC_CMD.tail_beta = CHASSIS.ref.tail_state.beta;
+}
 
 /******************************************************************/
 /* Init                                                           */
@@ -355,6 +401,12 @@ void ChassisSetMode(void)
         CHASSIS.mode = CHASSIS_SAFE;
         return;
     }
+
+    if (chassis_reset_hold_count > 0) {
+        chassis_reset_hold_count--;
+        CHASSIS.mode = CHASSIS_SAFE;
+        return;
+    }
 #if TAKE_OFF_DETECT
     // 离地状态切换
     for (uint8_t i = 0; i < 2; i++) {
@@ -418,6 +470,7 @@ void ChassisObserver(void)
     UpdateStepStatus();
 
     BodyMotionObserve();
+    CheckMotorOfflineStatusChange();
 }
 
 /**
@@ -435,6 +488,272 @@ static void UpdateMotorStatus(void)
     }
 
     GetMotorMeasure(&CHASSIS.tail_motor);
+}
+
+static uint8_t GetChassisMotorOfflineMask(void)
+{
+    uint8_t mask = 0;
+
+    for (uint8_t i = 0; i < 4; i++) {
+        if (CHASSIS.joint_motor[i].offline) {
+            mask |= (uint8_t)(1 << i);
+        }
+    }
+
+    for (uint8_t i = 0; i < 2; i++) {
+        if (CHASSIS.wheel_motor[i].offline) {
+            mask |= (uint8_t)(1 << (i + 4));
+        }
+    }
+
+    if (CHASSIS.tail_motor.offline) {
+        mask |= (uint8_t)(1 << 6);
+    }
+
+    return mask;
+}
+
+static void CheckMotorOfflineStatusChange(void)
+{
+    static uint8_t initialized = 0;
+    static uint8_t last_stable_mask = 0;
+    static uint8_t pending_mask = 0;
+    static uint8_t pending_change = 0;
+    static uint32_t pending_time = 0;
+    static uint32_t last_reset_time = 0;
+
+    uint32_t now = xTaskGetTickCount();
+    uint8_t current_mask = GetChassisMotorOfflineMask();
+
+    if (!initialized) {
+        initialized = 1;
+        last_stable_mask = current_mask;
+        return;
+    }
+
+    if (current_mask == last_stable_mask) {
+        pending_change = 0;
+        return;
+    }
+
+    if (!pending_change || pending_mask != current_mask) {
+        pending_change = 1;
+        pending_mask = current_mask;
+        pending_time = now;
+        return;
+    }
+
+    if (now - pending_time < MOTOR_RESET_STABLE_TIME_MS) {
+        return;
+    }
+
+    pending_change = 0;
+    last_stable_mask = current_mask;
+
+    if (last_reset_time != 0 && now - last_reset_time < MOTOR_RESET_COOLDOWN_TIME_MS) {
+        return;
+    }
+
+    last_reset_time = now;
+    ChassisControlReset();
+}
+
+static void ResetChassisPidConfig(void)
+{
+    memset(&CHASSIS.pid, 0, sizeof(CHASSIS.pid));
+
+    float yaw_angle_pid[3] = {KP_CHASSIS_YAW_ANGLE, KI_CHASSIS_YAW_ANGLE, KD_CHASSIS_YAW_ANGLE};
+    float yaw_velocity_pid[3] = {
+        KP_CHASSIS_YAW_VELOCITY, KI_CHASSIS_YAW_VELOCITY, KD_CHASSIS_YAW_VELOCITY};
+    PID_init(
+        &CHASSIS.pid.yaw_angle, PID_POSITION, yaw_angle_pid, MAX_OUT_CHASSIS_YAW_ANGLE,
+        MAX_IOUT_CHASSIS_YAW_ANGLE);
+    PID_init(
+        &CHASSIS.pid.yaw_velocity, PID_POSITION, yaw_velocity_pid, MAX_OUT_CHASSIS_YAW_VELOCITY,
+        MAX_IOUT_CHASSIS_YAW_VELOCITY);
+
+    float vel_add_pid[3] = {KP_CHASSIS_VEL_ADD, KI_CHASSIS_VEL_ADD, KD_CHASSIS_VEL_ADD};
+    PID_init(
+        &CHASSIS.pid.vel_add, PID_POSITION, vel_add_pid, MAX_OUT_CHASSIS_VEL_ADD,
+        MAX_IOUT_CHASSIS_VEL_ADD);
+
+    float LegCoordination_pid[3] = {KP_CHASSIS_LEG_COOR, KI_CHASSIS_LEG_COOR, KD_CHASSIS_LEG_COOR};
+    PID_init(
+        &CHASSIS.pid.leg_coordation, PID_POSITION, LegCoordination_pid, MAX_OUT_CHASSIS_LEG_COOR,
+        MAX_IOUT_CHASSIS_LEG_COOR);
+    PID_PositionSetEkSumRange(
+        &CHASSIS.pid.leg_coordation, ERRORSUM_LOW_LEG_COOR, ERRORSUM_UP_LEG_COOR);
+
+    float tail_comp_pid[3] = {KP_CHASSIS_TAIL_COMP, KI_CHASSIS_TAIL_COMP, KD_CHASSIS_TAIL_COMP};
+    PID_init(
+        &CHASSIS.pid.tail_comp, PID_POSITION, tail_comp_pid, MAX_OUT_CHASSIS_TAIL_COMP,
+        MAX_IOUT_CHASSIS_TAIL_COMP);
+
+    float tail_up_pid[3] = {KP_CHASSIS_TAIL_UP, KI_CHASSIS_TAIL_UP, KD_CHASSIS_TAIL_UP};
+    PID_init(
+        &CHASSIS.pid.tail_up, PID_POSITION, tail_up_pid, MAX_OUT_CHASSIS_TAIL_UP,
+        MAX_IOUT_CHASSIS_TAIL_UP);
+
+    float tail_z_pid[3] = {KP_CHASSIS_TAIL_Z, KI_CHASSIS_TAIL_Z, KD_CHASSIS_TAIL_Z};
+    PID_init(
+        &CHASSIS.pid.tail_z, PID_POSITION, tail_z_pid, MAX_OUT_CHASSIS_TAIL_Z,
+        MAX_IOUT_CHASSIS_TAIL_Z);
+
+    float roll_angle_pid[3] = {KP_CHASSIS_ROLL_ANGLE, KI_CHASSIS_ROLL_ANGLE, KD_CHASSIS_ROLL_ANGLE};
+    float leg_length_length_pid[3] = {
+        KP_CHASSIS_LEG_LENGTH_LENGTH, KI_CHASSIS_LEG_LENGTH_LENGTH, KD_CHASSIS_LEG_LENGTH_LENGTH};
+
+    PID_init(
+        &CHASSIS.pid.roll_angle, PID_POSITION, roll_angle_pid, MAX_OUT_CHASSIS_ROLL_ANGLE,
+        MAX_IOUT_CHASSIS_ROLL_ANGLE);
+    CHASSIS.pid.roll_angle.N = N_CHASSIS_ROLL_ANGLE;
+
+    float theta_comp_pid[3] = {KP_CHASSIS_THETA_COMP, KI_CHASSIS_THETA_COMP, KD_CHASSIS_THETA_COMP};
+    PID_init(
+        &CHASSIS.pid.theta_comp, PID_POSITION, theta_comp_pid, MAX_OUT_CHASSIS_THETA_COMP,
+        MAX_IOUT_CHASSIS_THETA_COMP);
+    CHASSIS.pid.roll_angle.N = N_CHASSIS_THETA_COMP;
+
+    PID_init(
+        &CHASSIS.pid.leg_length_length[0], PID_POSITION, leg_length_length_pid,
+        MAX_OUT_CHASSIS_LEG_LENGTH_LENGTH, MAX_IOUT_CHASSIS_LEG_LENGTH_LENGTH);
+    CHASSIS.pid.leg_length_length[0].N = N_LEG_LENGTH_LENGTH;
+    PID_PositionSetEkSumRange(
+        &CHASSIS.pid.leg_length_length[0], ERRORSUM_LOW_LEG_LENGTH, ERRORSUM_UP_LEG_LENGTH);
+
+    PID_init(
+        &CHASSIS.pid.leg_length_length[1], PID_POSITION, leg_length_length_pid,
+        MAX_OUT_CHASSIS_LEG_LENGTH_LENGTH, MAX_IOUT_CHASSIS_LEG_LENGTH_LENGTH);
+    CHASSIS.pid.leg_length_length[1].N = N_LEG_LENGTH_LENGTH;
+    PID_PositionSetEkSumRange(
+        &CHASSIS.pid.leg_length_length[1], ERRORSUM_LOW_LEG_LENGTH, ERRORSUM_UP_LEG_LENGTH);
+
+    float stand_up_pid[3] = {KP_CHASSIS_STAND_UP, KI_CHASSIS_STAND_UP, KD_CHASSIS_STAND_UP};
+    PID_init(
+        &CHASSIS.pid.stand_up, PID_POSITION, stand_up_pid, MAX_OUT_CHASSIS_STAND_UP,
+        MAX_IOUT_CHASSIS_STAND_UP);
+
+    float wheel_stop_pid[3] = {KP_CHASSIS_WHEEL_STOP, KI_CHASSIS_WHEEL_STOP, KD_CHASSIS_WHEEL_STOP};
+    PID_init(
+        &CHASSIS.pid.wheel_stop[0], PID_POSITION, wheel_stop_pid, MAX_OUT_CHASSIS_WHEEL_STOP,
+        MAX_IOUT_CHASSIS_WHEEL_STOP);
+    PID_init(
+        &CHASSIS.pid.wheel_stop[1], PID_POSITION, wheel_stop_pid, MAX_OUT_CHASSIS_WHEEL_STOP,
+        MAX_IOUT_CHASSIS_WHEEL_STOP);
+}
+
+static void ResetChassisFilters(void)
+{
+    LowPassFilterInit(&CHASSIS.lpf.leg_l0_accel_filter[0], LEG_DDL0_LPF_ALPHA);
+    LowPassFilterInit(&CHASSIS.lpf.leg_l0_accel_filter[1], LEG_DDL0_LPF_ALPHA);
+
+    LowPassFilterInit(&CHASSIS.lpf.leg_phi0_accel_filter[0], LEG_DDPHI0_LPF_ALPHA);
+    LowPassFilterInit(&CHASSIS.lpf.leg_phi0_accel_filter[1], LEG_DDPHI0_LPF_ALPHA);
+
+    LowPassFilterInit(&CHASSIS.lpf.leg_theta_accel_filter[0], LEG_DDTHETA_LPF_ALPHA);
+    LowPassFilterInit(&CHASSIS.lpf.leg_theta_accel_filter[1], LEG_DDTHETA_LPF_ALPHA);
+
+    LowPassFilterInit(&CHASSIS.lpf.support_force_filter[0], LEG_SUPPORT_FORCE_LPF_ALPHA);
+    LowPassFilterInit(&CHASSIS.lpf.support_force_filter[1], LEG_SUPPORT_FORCE_LPF_ALPHA);
+
+    LowPassFilterInit(&CHASSIS.lpf.roll, CHASSIS_ROLL_ALPHA);
+}
+
+static void ResetBodyVelocityObserverConfig(void)
+{
+    float F[4] = {1, 0.005, 0, 1};
+    float Q[4] = {VEL_PROCESS_NOISE, 0, 0, ACC_PROCESS_NOISE};
+    float R[4] = {VEL_MEASURE_NOISE, 0, 0, ACC_MEASURE_NOISE};
+    float P[4] = {100000, 0, 0, 100000};
+    float H[4] = {1, 0, 0, 1};
+
+    memset(OBSERVER.body.v_kf.xhat_data, 0, sizeof(float) * 2);
+    memset(OBSERVER.body.v_kf.xhatminus_data, 0, sizeof(float) * 2);
+    memset(OBSERVER.body.v_kf.FilteredValue, 0, sizeof(float) * 2);
+    memset(OBSERVER.body.v_kf.MeasuredVector, 0, sizeof(float) * 2);
+    memcpy(OBSERVER.body.v_kf.P_data, P, sizeof(P));
+    memcpy(OBSERVER.body.v_kf.Pminus_data, P, sizeof(P));
+    memcpy(OBSERVER.body.v_kf.F_data, F, sizeof(F));
+    memcpy(OBSERVER.body.v_kf.Q_data, Q, sizeof(Q));
+    memcpy(OBSERVER.body.v_kf.R_data, R, sizeof(R));
+    memcpy(OBSERVER.body.v_kf.H_data, H, sizeof(H));
+}
+
+static void ResetChassisReferenceState(void)
+{
+    chassis_ref_angle = 0.0f;
+    chassis_ref_tail_angle = 0.0f;
+    chassis_ref_length = CHASSIS_REFERENCE_DEFAULT_LENGTH;
+    chassis_clamp_target_position = CHASSIS_CLAMP_DEFAULT_POSITION;
+    chassis_clamp_target_valid = false;
+}
+
+static void ResetChassisMotorCmd(void)
+{
+    for (uint8_t i = 0; i < 4; i++) {
+        memset(&CHASSIS.joint_motor[i].set, 0, sizeof(CHASSIS.joint_motor[i].set));
+    }
+    for (uint8_t i = 0; i < 2; i++) {
+        memset(&CHASSIS.wheel_motor[i].set, 0, sizeof(CHASSIS.wheel_motor[i].set));
+    }
+    memset(&CHASSIS.tail_motor.set, 0, sizeof(CHASSIS.tail_motor.set));
+}
+
+static void ResetChassisFeedbackState(void)
+{
+    memset(&CHASSIS.fdb, 0, sizeof(CHASSIS.fdb));
+    CHASSIS.fdb.leg[0].is_take_off = false;
+    CHASSIS.fdb.leg[1].is_take_off = false;
+    CHASSIS.last_time = xTaskGetTickCount();
+    CHASSIS.duration = CHASSIS_CONTROL_TIME_MS;
+
+    UpdateMotorStatus();
+    UpdateBodyStatus();
+    UpdateLegStatus();
+    BodyMotionObserve();
+
+    CHASSIS.fdb.body.x = 0.0f;
+    CHASSIS.fdb.body.x_dot_obv = 0.0f;
+    CHASSIS.fdb.body.x_acc_obv = 0.0f;
+    CHASSIS.fdb.leg_state[0].x = 0.0f;
+    CHASSIS.fdb.leg_state[1].x = 0.0f;
+    CHASSIS.fdb.leg_state[0].x_dot = 0.0f;
+    CHASSIS.fdb.leg_state[1].x_dot = 0.0f;
+
+    last_dBeta = CHASSIS.fdb.tail.dBeta;
+
+    for (uint8_t i = 0; i < 2; i++) {
+        CHASSIS.fdb.leg_state[i].Delta_theta = 0.0f;
+        CHASSIS.fdb.leg_state[i].Delta_theta_dot = 0.0f;
+        CHASSIS.fdb.leg_state[i].Delta_x = 0.0f;
+        CHASSIS.fdb.leg_state[i].Delta_x_dot = 0.0f;
+        CHASSIS.fdb.leg_state[i].Delta_phi = 0.0f;
+        CHASSIS.fdb.leg_state[i].Delta_phi_dot = 0.0f;
+        CHASSIS.fdb.leg_state[i].last_theta = CHASSIS.fdb.leg_state[i].theta;
+        CHASSIS.fdb.leg_state[i].last_theta_dot = CHASSIS.fdb.leg_state[i].theta_dot;
+        CHASSIS.fdb.leg_state[i].last_x = 0.0f;
+        CHASSIS.fdb.leg_state[i].last_x_dot = 0.0f;
+        CHASSIS.fdb.leg_state[i].last_phi = CHASSIS.fdb.leg_state[i].phi;
+        CHASSIS.fdb.leg_state[i].last_phi_dot = CHASSIS.fdb.leg_state[i].phi_dot;
+    }
+}
+
+static void ChassisControlReset(void)
+{
+    ImuRequestReset();
+    ResetChassisReferenceState();
+    ResetChassisPidConfig();
+    ResetChassisFilters();
+    ResetBodyVelocityObserverConfig();
+    memset(&CHASSIS.cmd, 0, sizeof(CHASSIS.cmd));
+    memset(&CHASSIS.ref, 0, sizeof(CHASSIS.ref));
+    ResetChassisMotorCmd();
+    ResetChassisFeedbackState();
+    CHASSIS.step = NORMAL_STEP;
+    CHASSIS.step_time = 0;
+    CHASSIS.ref.body.yaw = 0.0f;
+    CHASSIS.mode = CHASSIS_SAFE;
+    chassis_reset_hold_count = CHASSIS_RESET_HOLD_CYCLES;
 }
 
 static void UpdateBodyStatus(void)  //主要是imu和磁力计那些
@@ -889,70 +1208,66 @@ void ChassisReference(void)
         fp32_constrain(-rc_pitch * RC_TO_ONE * MAX_PITCH, MIN_PITCH, MAX_PITCH);
 
     // 腿部控制
-    static float angle = 0;
-    static float tail_angle = 0;  //水平朝前
-    static float length = 0.16f;
-
     float angle_fdb = (CHASSIS.fdb.leg_state[0].theta + CHASSIS.fdb.leg_state[1].theta) / 2.0f;
     float length_fdb = (CHASSIS.fdb.leg[0].rod.L0 + CHASSIS.fdb.leg[1].rod.L0) / 2.0f;
 
     switch (CHASSIS.mode) {
         case CHASSIS_STAND_UP: {
-            length = 0.148f;
-            angle = 0;
-            tail_angle = 0;
+            chassis_ref_length = 0.148f;
+            chassis_ref_angle = 0.0f;
+            chassis_ref_tail_angle = 0.0f;
         } break;
         case CHASSIS_NOTAIL: {
-            length = 0.17f + rc_length * RC_TO_ONE * 0.08f;
-            angle = 0.0f;
-            tail_angle = 0.0f;
+            chassis_ref_length = 0.17f + rc_length * RC_TO_ONE * 0.08f;
+            chassis_ref_angle = 0.0f;
+            chassis_ref_tail_angle = 0.0f;
             if (CHASSIS.step == JUMP_STEP_SQUST) {
-                length = MIN_LEG_LENGTH;
+                chassis_ref_length = MIN_LEG_LENGTH;
             } else if (CHASSIS.step == JUMP_STEP_JUMP) {
-                length = MAX_LEG_LENGTH;
+                chassis_ref_length = MAX_LEG_LENGTH;
             } else if (CHASSIS.step == JUMP_STEP_RECOVERY) {
-                length = MIN_LEG_LENGTH + 0.05f;
+                chassis_ref_length = MIN_LEG_LENGTH + 0.05f;
             }
         } break;
         case CHASSIS_TRIPOD: {  //尾巴落地 扭矩控制
-            length = 0.17f + rc_length * RC_TO_ONE * 0.08f;
-            angle = rc_angle * RC_TO_ONE * 0.3f;
+            chassis_ref_length = 0.17f + rc_length * RC_TO_ONE * 0.08f;
+            chassis_ref_angle = rc_angle * RC_TO_ONE * 0.3f;
             // angle = Get_theta_ref_tripod(length) + rc_angle * RC_TO_ONE * 0.1f;
             // tail_angle = Get_beta(length, angle, CHASSIS.ref.body.pitch);
-            tail_angle = Get_beta(
+            chassis_ref_tail_angle = Get_beta(
                 CHASSIS.fdb.leg[0].rod.L0, CHASSIS.fdb.leg_state[0].theta,
                 CHASSIS.fdb.leg[1].rod.L0, CHASSIS.fdb.leg_state[1].theta, CHASSIS.fdb.body.pitch);
         } break;
         case CHASSIS_BIPEDAL: {  //尾巴离地 位置控制
-            length = 0.17f + rc_length * RC_TO_ONE * 0.08f;
+            chassis_ref_length = 0.17f + rc_length * RC_TO_ONE * 0.08f;
             // angle = rc_angle * RC_TO_ONE * 0.3f; // 待改正，引入重心调节
-            angle = 0.0f;  // 加入质心调节，尾巴上摆，腿往后撤维持重心在同一竖直位置
+            chassis_ref_angle = 0.0f;  // 加入质心调节，尾巴上摆，腿往后撤维持重心在同一竖直位置
             // tail_angle = Get_beta_ref(length_fdb, angle_fdb, CHASSIS.fdb.body.pitch) -
             //              rc_tail * RC_TO_ONE * 0.4f;
-            tail_angle = Get_beta(
+            chassis_ref_tail_angle = Get_beta(
                              CHASSIS.fdb.leg[0].rod.L0, CHASSIS.fdb.leg_state[0].theta,
                              CHASSIS.fdb.leg[1].rod.L0, CHASSIS.fdb.leg_state[1].theta,
                              CHASSIS.fdb.body.pitch) -
                          rc_tail * RC_TO_ONE * 0.4f;
         } break;
         default: {
-            angle = 0;
-            length = 0.16f;
-            tail_angle = 0;
+            chassis_ref_angle = 0.0f;
+            chassis_ref_length = CHASSIS_REFERENCE_DEFAULT_LENGTH;
+            chassis_ref_tail_angle = 0.0f;
         } break;
     }
-    length = fp32_constrain(length, MIN_LEG_LENGTH, MAX_LEG_LENGTH);
-    angle = fp32_constrain(angle, MIN_LEG_ANGLE, MAX_LEG_ANGLE);
-    tail_angle = fp32_constrain(
-        tail_angle, MIN_TAIL_ANGLE,
+    chassis_ref_length = fp32_constrain(chassis_ref_length, MIN_LEG_LENGTH, MAX_LEG_LENGTH);
+    chassis_ref_angle = fp32_constrain(chassis_ref_angle, MIN_LEG_ANGLE, MAX_LEG_ANGLE);
+    chassis_ref_tail_angle = fp32_constrain(
+        chassis_ref_tail_angle, MIN_TAIL_ANGLE,
         Get_beta(
             CHASSIS.fdb.leg[0].rod.L0, CHASSIS.fdb.leg_state[0].theta, CHASSIS.fdb.leg[1].rod.L0,
             CHASSIS.fdb.leg_state[1].theta, CHASSIS.fdb.body.pitch));
 
-    CHASSIS.ref.rod_L0[0] = length;
-    CHASSIS.ref.rod_L0[1] = length;
-    CHASSIS.ref.rod_Angle[0] = angle;
-    CHASSIS.ref.rod_Angle[1] = angle;
+    CHASSIS.ref.rod_L0[0] = chassis_ref_length;
+    CHASSIS.ref.rod_L0[1] = chassis_ref_length;
+    CHASSIS.ref.rod_Angle[0] = chassis_ref_angle;
+    CHASSIS.ref.rod_Angle[1] = chassis_ref_angle;
 
     // 计算期望状态
     // clang-format off
@@ -964,35 +1279,34 @@ void ChassisReference(void)
         CHASSIS.ref.leg_state[i].phi       =  CHASSIS.ref.body.pitch;
         CHASSIS.ref.leg_state[i].phi_dot   =  0;
     }
-    CHASSIS.ref.tail_state.beta        =  tail_angle;
+    CHASSIS.ref.tail_state.beta        =  chassis_ref_tail_angle;
     CHASSIS.ref.tail_state.beta_dot    =  0;
     // clang-format on
 
     // 夹爪目标量：仅在模式开关和功能开关都拨到下时启用相对控制。
     // 右拨增加开合目标位置，左拨减小开合目标位置，回中保持当前位置不变。
-    static uint8_t clamp_target_position = 0x80;
-    static bool clamp_target_valid = false;
-
     if (switch_is_down(CHASSIS.rc->rc.s[CHASSIS_MODE_CHANNEL]) &&
         switch_is_down(CHASSIS.rc->rc.s[CHASSIS_FUNCTION])) {
-        if (!clamp_target_valid) {
-            clamp_target_valid = true;
+        if (!chassis_clamp_target_valid) {
+            chassis_clamp_target_valid = true;
         }
 
         if (rc_hand != 0) {
             uint8_t step = ClampRcToStep(rc_hand);
 
             if (rc_hand > 0) {
-                clamp_target_position = (uint8_t)fp32_constrain(
-                    (float)clamp_target_position + step, 0.0f, 255.0f);
+                chassis_clamp_target_position = (uint8_t)fp32_constrain(
+                    (float)chassis_clamp_target_position + step, 0.0f, 255.0f);
             } else {
-                clamp_target_position = (uint8_t)fp32_constrain(
-                    (float)clamp_target_position - step, 0.0f, 255.0f);
+                chassis_clamp_target_position = (uint8_t)fp32_constrain(
+                    (float)chassis_clamp_target_position - step, 0.0f, 255.0f);
             }
 
-            ClampSetTarget(clamp_target_position, 0xFF, 0xFF);
+            ClampSetTarget(chassis_clamp_target_position, 0xFF, 0xFF);
         }
     }
+
+    UpdateChassisSolvedRcCmd();
 }
 
 /******************************************************************/
