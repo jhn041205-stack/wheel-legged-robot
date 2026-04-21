@@ -17,6 +17,7 @@
 #include "oled_task.h"
 
 #include "cmsis_os.h"
+#include "chassis_balance.h"
 #include "detect_task.h"
 #include "IMU.h"
 #include "main.h"
@@ -25,8 +26,11 @@
 
 #define OLED_CONTROL_TIME 10
 #define REFRESH_RATE 10
-#ifndef OLED_DEBUG_IMU_PAGE
-#define OLED_DEBUG_IMU_PAGE 1
+#ifndef OLED_DEBUG_LQR_PAGE
+#define OLED_DEBUG_LQR_PAGE 1
+#endif
+#ifndef OLED_LQR_PAGE_HOLD_REFRESHES
+#define OLED_LQR_PAGE_HOLD_REFRESHES 20
 #endif
 
 const error_t * error_list_local;
@@ -36,8 +40,10 @@ uint8_t other_toe_name[4][4] = {"GYR\0","ACC\0","MAG\0"};
 uint8_t last_oled_error = 0;
 uint8_t now_oled_errror = 0;
 static uint8_t refresh_tick = 0;
+static uint8_t lqr_page_index = 0;
+static uint8_t lqr_page_refresh_count = 0;
 
-#if OLED_DEBUG_IMU_PAGE
+#if OLED_DEBUG_LQR_PAGE
 static void oled_split_centi(float value, char *sign, uint16_t *integer, uint16_t *decimal)
 {
     int32_t centi;
@@ -75,13 +81,83 @@ static void oled_print_pair(uint8_t col, uint8_t row, const char *left_label, fl
                 right_label, right_sign, (unsigned int)right_integer, (unsigned int)right_decimal);
 }
 
-static void oled_show_imu_debug(void)
+static const char * oled_get_mode_name(ChassisMode_e mode)
 {
-    oled_print_pair(0, 0,  "P",  GetImuAngle(AX_PITCH),    "R",  GetImuAngle(AX_ROLL));
-    oled_print_pair(0, 12, "Y",  GetImuAngle(AX_YAW),      "GZ", GetImuVelocity(AX_YAW));
-    oled_print_pair(0, 24, "AX", GetImuAccel(AX_X),        "AY", GetImuAccel(AX_Y));
-    oled_print_pair(0, 36, "AZ", GetImuAccel(AX_Z),        "RX", get_raw_accel(AX_X));
-    oled_print_pair(0, 48, "RY", get_raw_accel(AX_Y),      "RZ", get_raw_accel(AX_Z));
+    switch (mode) {
+        case CHASSIS_NOTAIL:
+            return "NT";
+        case CHASSIS_BIPEDAL:
+            return "BP";
+        case CHASSIS_TRIPOD:
+            return "TP";
+        case CHASSIS_JOINED:
+            return "JN";
+        case CHASSIS_STAND_UP:
+            return "SU";
+        case CHASSIS_SAFE:
+            return "SF";
+        case CHASSIS_OFF:
+        default:
+            return "OF";
+    }
+}
+
+static uint8_t oled_get_lqr_page_count(ChassisMode_e mode)
+{
+    switch (mode) {
+        case CHASSIS_BIPEDAL:
+        case CHASSIS_TRIPOD:
+            return 2;
+        case CHASSIS_NOTAIL:
+        case CHASSIS_JOINED:
+        case CHASSIS_STAND_UP:
+        case CHASSIS_SAFE:
+        case CHASSIS_OFF:
+        default:
+            return 2;
+    }
+}
+
+static void oled_show_lqr_debug(void)
+{
+    const Chassis_s * chassis = ChassisGetData();
+    uint8_t page_count = oled_get_lqr_page_count(chassis->mode);
+    uint8_t page = lqr_page_index % page_count;
+
+    OLED_printf(0, 0, "LQR %s %u/%u", oled_get_mode_name(chassis->mode),
+                (unsigned int)(page + 1), (unsigned int)page_count);
+
+    if (page == 0) {
+        oled_print_pair(0, 12, "X",  chassis->fdb.body.x,          "DX", chassis->fdb.body.x_dot_obv);
+        oled_print_pair(0, 24, "YA", chassis->fdb.body.yaw,        "DY", chassis->fdb.body.yaw_dot);
+        oled_print_pair(0, 36, "TL", chassis->fdb.leg_state[0].theta, "DL", chassis->fdb.leg_state[0].theta_dot);
+        oled_print_pair(0, 48, "TR", chassis->fdb.leg_state[1].theta, "DR", chassis->fdb.leg_state[1].theta_dot);
+    } else {
+        oled_print_pair(0, 12, "PH", chassis->fdb.body.phi,        "DP", chassis->fdb.body.phi_dot);
+
+        if (chassis->mode == CHASSIS_BIPEDAL || chassis->mode == CHASSIS_TRIPOD) {
+            oled_print_pair(0, 24, "BT", chassis->fdb.tail_state.beta, "DB", chassis->fdb.tail_state.beta_dot);
+        } else {
+            OLED_printf(0, 24, "BT N/A DB N/A");
+        }
+    }
+}
+
+static void oled_update_lqr_page(void)
+{
+    const Chassis_s * chassis = ChassisGetData();
+    uint8_t page_count = oled_get_lqr_page_count(chassis->mode);
+
+    lqr_page_refresh_count++;
+    if (lqr_page_refresh_count >= OLED_LQR_PAGE_HOLD_REFRESHES) {
+        lqr_page_refresh_count = 0;
+        lqr_page_index++;
+        if (lqr_page_index >= page_count) {
+            lqr_page_index = 0;
+        }
+    } else if (lqr_page_index >= page_count) {
+        lqr_page_index = 0;
+    }
 }
 #endif
 
@@ -98,7 +174,7 @@ static void oled_show_imu_debug(void)
 void oled_task(void const * argument)
 {
     uint8_t i;
-#if !OLED_DEBUG_IMU_PAGE
+#if !OLED_DEBUG_LQR_PAGE
     uint8_t show_col, show_row;
 #endif
     error_list_local = get_error_list_point();
@@ -130,8 +206,9 @@ void oled_task(void const * argument)
             if (refresh_tick > configTICK_RATE_HZ / (OLED_CONTROL_TIME * REFRESH_RATE)) {
                 refresh_tick = 0;
                 OLED_operate_gram(PEN_CLEAR);
-#if OLED_DEBUG_IMU_PAGE
-                oled_show_imu_debug();
+#if OLED_DEBUG_LQR_PAGE
+                oled_update_lqr_page();
+                oled_show_lqr_debug();
 #else
                 OLED_show_graphic(0, 1, &battery_box);
 

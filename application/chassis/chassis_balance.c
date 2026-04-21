@@ -48,6 +48,7 @@
 #define CLOSE_LEG_RIGHT 0  // 关闭右腿输出
 #define LIFTED_UP 0        // 被架起
 #define PRO_CONTROLLER 1   //
+#define LQR_POSITION_FEEDBACK 0  // 0: disable x-position hold so external pushes do not accumulate position error
 #define MOTOR_RESET_STABLE_TIME_MS 40
 #define MOTOR_RESET_COOLDOWN_TIME_MS 500
 #define CHASSIS_RESET_HOLD_CYCLES 5
@@ -1189,7 +1190,11 @@ void ChassisReference(void)
             CHASSIS.ref.speed_vector.wz = v_set.wz;
             CHASSIS.ref.body.yaw += CHASSIS.ref.speed_vector.wz * CHASSIS_CONTROL_TIME_S;
             CHASSIS.ref.body.yaw = WrapToPi(CHASSIS.ref.body.yaw);
+#if LQR_POSITION_FEEDBACK
             CHASSIS.ref.body.x += CHASSIS.ref.speed_vector.vx * CHASSIS_CONTROL_TIME_S;
+#else
+            CHASSIS.ref.body.x = CHASSIS.fdb.body.x;
+#endif
         } break;
 
         case CHASSIS_STAND_UP:
@@ -1274,7 +1279,11 @@ void ChassisReference(void)
     for (uint8_t i = 0; i < 2; i++) {
         CHASSIS.ref.leg_state[i].theta     =  CHASSIS.ref.rod_Angle[i];
         CHASSIS.ref.leg_state[i].theta_dot =  0;
+#if LQR_POSITION_FEEDBACK
         CHASSIS.ref.leg_state[i].x        +=  CHASSIS.ref.speed_vector.vx * CHASSIS_CONTROL_TIME_S;
+#else
+        CHASSIS.ref.leg_state[i].x         =  CHASSIS.fdb.leg_state[i].x;
+#endif
         CHASSIS.ref.leg_state[i].x_dot     =  CHASSIS.ref.speed_vector.vx;
         CHASSIS.ref.leg_state[i].phi       =  CHASSIS.ref.body.pitch;
         CHASSIS.ref.leg_state[i].phi_dot   =  0;
@@ -2387,6 +2396,7 @@ static void SendWheelMotorCmd(void)
 /*                     ChassisGetSpeedWz                          */
 /******************************************************************/
 
+const Chassis_s * ChassisGetData(void) { return &CHASSIS; }
 inline uint8_t ChassisGetStatus(void) { return 0; }
 inline uint32_t ChassisGetDuration(void) { return CHASSIS.duration; }
 inline float ChassisGetSpeedVx(void) { return CHASSIS.fdb.speed_vector.vx; }

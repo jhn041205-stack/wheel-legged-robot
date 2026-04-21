@@ -320,6 +320,7 @@ extern void ChassisObserver(void);
 extern void ChassisReference(void);
 extern void ChassisConsole(void);
 extern void ChassisSendCmd(void);
+extern const Chassis_s * ChassisGetData(void);
 
 #endif /* CHASSIS_BIPEDAL_H */
 /*------------------------------ End of File ------------------------------*/
